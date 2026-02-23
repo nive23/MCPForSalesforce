@@ -1,9 +1,12 @@
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-gunicorn==21.2.0
-simple-salesforce==1.12.6
-PyJWT==2.9.0
-cryptography==43.0.0
-requests==2.32.3
-dnspython==2.6.1
+simple-salesforce
+python-dotenv
+PyJWT
+cryptography
+mcp[cli]
+fastmcp
+dnspython
+requests
+uvicorn
+fastapi
+
 
