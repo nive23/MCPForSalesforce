@@ -140,6 +140,31 @@ def handle_account_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[
     else:
         raise ValueError(f"Unknown account tool: {tool_name}")
 
+# Map our snake_case field names to Salesforce Account API names (PascalCase)
+ACCOUNT_FIELD_TO_API = {
+    "type": "Type",
+    "phone": "Phone",
+    "website": "Website",
+    "industry": "Industry",
+    "annual_revenue": "AnnualRevenue",
+    "number_of_employees": "NumberOfEmployees",
+    "description": "Description",
+    "billing_street": "BillingStreet",
+    "billing_city": "BillingCity",
+    "billing_state": "BillingState",
+    "billing_postal_code": "BillingPostalCode",
+    "billing_country": "BillingCountry",
+    "shipping_street": "ShippingStreet",
+    "shipping_city": "ShippingCity",
+    "shipping_state": "ShippingState",
+    "shipping_postal_code": "ShippingPostalCode",
+    "shipping_country": "ShippingCountry",
+    "account_source": "AccountSource",
+    "fax": "Fax",
+    "sic_desc": "SicDesc",
+    "parent_id": "ParentId",
+}
+
 def create_account(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new account in Salesforce"""
     try:
@@ -153,28 +178,9 @@ def create_account(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
             "Name": name
         }
         
-        # Add optional fields
-        optional_fields = [
-            "type", "phone", "website", "industry", "annual_revenue",
-            "number_of_employees", "description", "billing_street",
-            "billing_city", "billing_state", "billing_postal_code",
-            "billing_country", "shipping_street", "shipping_city",
-            "shipping_state", "shipping_postal_code", "shipping_country",
-            "account_source", "fax", "sic_desc", "parent_id"
-        ]
-        
-        for field in optional_fields:
+        for field, sf_field in ACCOUNT_FIELD_TO_API.items():
             value = arguments.get(field)
             if value is not None:
-                # Convert field name to Salesforce API name (capitalize first letter)
-                sf_field = field[0].upper() + field[1:] if field else field
-                # Handle special cases
-                if field == "type":
-                    sf_field = "Type"
-                elif field == "account_source":
-                    sf_field = "AccountSource"
-                elif field == "parent_id":
-                    sf_field = "ParentId"
                 account_data[sf_field] = value
         
         # Add custom fields
@@ -227,4 +233,5 @@ def get_accounts(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
             "success": False,
             "error": error_msg
         }
+
 
