@@ -81,9 +81,17 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                         "type": "string",
                         "description": "Industry"
                     },
+                    "annual_revenue": {
+                        "type": "number",
+                        "description": "Annual revenue (e.g., 10000)"
+                    },
+                    "product_description": {
+                        "type": "string",
+                        "description": "Product description - stored in custom field Product_Description__c (e.g., One Basic Laptop Bundle)"
+                    },
                     "custom_fields": {
                         "type": "object",
-                        "description": "Additional custom fields as key-value pairs"
+                        "description": "Additional custom fields as key-value pairs (e.g., Product_Description__c for product description)"
                     }
                 },
                 "required": ["last_name", "company"]
@@ -150,7 +158,7 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         optional_fields = [
             "first_name", "email", "phone", "title", "rating", "status",
             "lead_source", "street", "city", "state", "postal_code",
-            "country", "website", "industry"
+            "country", "website", "industry", "annual_revenue"
         ]
         
         for field in optional_fields:
@@ -167,9 +175,16 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
                     sf_field = "LeadSource"
                 elif field == "postal_code":
                     sf_field = "PostalCode"
+                elif field == "annual_revenue":
+                    sf_field = "AnnualRevenue"
                 lead_data[sf_field] = value
         
-        # Add custom fields
+        # Product description -> custom field Product_Description__c
+        product_description = arguments.get("product_description")
+        if product_description is not None:
+            lead_data["Product_Description__c"] = product_description
+        
+        # Add custom fields (can override product_description if both provided)
         custom_fields = arguments.get("custom_fields", {})
         if custom_fields:
             lead_data.update(custom_fields)
@@ -244,4 +259,5 @@ def add_lead_to_campaign(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
             "success": False,
             "error": error_msg
         }
+
 
