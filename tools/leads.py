@@ -87,11 +87,15 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                     },
                     "product_description": {
                         "type": "string",
-                        "description": "Product description - stored in custom field Product_Description__c (e.g., One Basic Laptop Bundle)"
+                        "description": "Product description - stored in custom field Product_Description__c (e.g., One Basic Laptop Bundle). Always pass this when the user asks for product description."
+                    },
+                    "Product_Description__c": {
+                        "type": "string",
+                        "description": "Custom field: Product Description (API name Product_Description__c). Use this or product_description."
                     },
                     "custom_fields": {
                         "type": "object",
-                        "description": "Additional custom fields as key-value pairs (e.g., Product_Description__c for product description)"
+                        "description": "Additional custom fields as key-value pairs"
                     }
                 },
                 "required": ["last_name", "company"]
@@ -179,15 +183,15 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
                     sf_field = "AnnualRevenue"
                 lead_data[sf_field] = value
         
-        # Product description -> custom field Product_Description__c
-        product_description = arguments.get("product_description")
-        if product_description is not None:
-            lead_data["Product_Description__c"] = product_description
-        
-        # Add custom fields (can override product_description if both provided)
+        # Add custom fields first
         custom_fields = arguments.get("custom_fields", {})
         if custom_fields:
             lead_data.update(custom_fields)
+        
+        # Product description -> custom field Product_Description__c (set after custom_fields so it is never overwritten)
+        product_description = arguments.get("product_description") or arguments.get("Product_Description__c")
+        if product_description is not None and str(product_description).strip():
+            lead_data["Product_Description__c"] = str(product_description).strip()
         
         # Create lead
         lead_sf = SFType('Lead', sf.session_id, sf.sf_instance)
