@@ -87,28 +87,56 @@ def get_contact_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "SALESFORCE_ADD_CONTACT_TO_CAMPAIGN",
-            "description": "Adds a contact to a campaign by creating a CampaignMember record, allowing you to track campaign engagement.",
+            "description": "Adds a contact to a campaign by creating a CampaignMember record to track campaign engagement. Fails if the contact is already a member of the campaign; pre-check membership via SOQL before calling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "contact_id": {
-                        "type": "string",
-                        "description": "Contact ID (required)"
-                    },
-                    "campaign_id": {
-                        "type": "string",
-                        "description": "Campaign ID (required)"
-                    },
-                    "status": {
-                        "type": "string",
-                        "description": "Campaign member status (e.g., Sent, Responded, Opted Out)"
-                    },
-                    "custom_fields": {
-                        "type": "object",
-                        "description": "Additional custom fields as key-value pairs"
-                    }
+                    "contact_id": {"type": "string", "description": "Contact ID (required)"},
+                    "campaign_id": {"type": "string", "description": "Campaign ID (required)"},
+                    "status": {"type": "string", "description": "Campaign member status (e.g., Sent, Responded, Opted Out)"},
+                    "custom_fields": {"type": "object", "description": "Additional custom fields"}
                 },
                 "required": ["contact_id", "campaign_id"]
+            }
+        },
+        {
+            "name": "SALESFORCE_DELETE_CONTACT",
+            "description": "Permanently deletes a contact from Salesforce. This action cannot be undone.",
+            "inputSchema": {"type": "object", "properties": {"contact_id": {"type": "string"}}, "required": ["contact_id"]}
+        },
+        {
+            "name": "SALESFORCE_GET_CONTACT",
+            "description": "Retrieves a specific contact by ID from Salesforce, returning all available fields.",
+            "inputSchema": {"type": "object", "properties": {"contact_id": {"type": "string"}, "fields": {"type": "string"}}, "required": ["contact_id"]}
+        },
+        {
+            "name": "SALESFORCE_LIST_CONTACTS",
+            "description": "Lists contacts from Salesforce using SOQL query.",
+            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}
+        },
+        {
+            "name": "SALESFORCE_SEARCH_CONTACTS",
+            "description": "Search Salesforce Contact records using name, email, phone, account, or title.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "email": {"type": "string"}, "phone": {"type": "string"}, "title": {"type": "string"}, "account_name": {"type": "string"}, "limit": {"type": "integer"}, "fields": {"type": "string"}}
+            }
+        },
+        {
+            "name": "SALESFORCE_UPDATE_CONTACT",
+            "description": "Updates an existing contact in Salesforce with the specified changes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contact_id": {"type": "string"},
+                    "first_name": {"type": "string"}, "last_name": {"type": "string"}, "email": {"type": "string"},
+                    "phone": {"type": "string"}, "mobile_phone": {"type": "string"}, "title": {"type": "string"},
+                    "department": {"type": "string"}, "birthdate": {"type": "string"}, "account_id": {"type": "string"},
+                    "description": {"type": "string"}, "mailing_street": {"type": "string"}, "mailing_city": {"type": "string"},
+                    "mailing_state": {"type": "string"}, "mailing_postal_code": {"type": "string"}, "mailing_country": {"type": "string"},
+                    "custom_fields": {"type": "object"}
+                },
+                "required": ["contact_id"]
             }
         }
     ]
@@ -116,13 +144,21 @@ def get_contact_tools() -> List[Dict[str, Any]]:
 def handle_contact_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle contact-related tool calls"""
     sf = get_salesforce()
-    
     if tool_name == "SALESFORCE_CREATE_CONTACT":
         return create_contact(sf, arguments)
-    elif tool_name == "SALESFORCE_ADD_CONTACT_TO_CAMPAIGN":
+    if tool_name == "SALESFORCE_ADD_CONTACT_TO_CAMPAIGN":
         return add_contact_to_campaign(sf, arguments)
-    else:
-        raise ValueError(f"Unknown contact tool: {tool_name}")
+    if tool_name == "SALESFORCE_DELETE_CONTACT":
+        return delete_contact(sf, arguments)
+    if tool_name == "SALESFORCE_GET_CONTACT":
+        return get_contact(sf, arguments)
+    if tool_name == "SALESFORCE_LIST_CONTACTS":
+        return list_contacts(sf, arguments)
+    if tool_name == "SALESFORCE_SEARCH_CONTACTS":
+        return search_contacts(sf, arguments)
+    if tool_name == "SALESFORCE_UPDATE_CONTACT":
+        return update_contact(sf, arguments)
+    raise ValueError(f"Unknown contact tool: {tool_name}")
 
 def create_contact(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new contact in Salesforce"""
@@ -200,17 +236,18 @@ def create_contact(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 def add_contact_to_campaign(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Add a contact to a campaign"""
+    """Add a contact to a campaign (fails if already a member)."""
     try:
         contact_id = arguments.get("contact_id")
         campaign_id = arguments.get("campaign_id")
-        
         if not contact_id:
             raise ValueError("Contact ID is required")
         if not campaign_id:
             raise ValueError("Campaign ID is required")
-        
-        # Build campaign member data
+        # Pre-check: contact already in campaign?
+        existing = sf.query(f"SELECT Id FROM CampaignMember WHERE ContactId = '{contact_id}' AND CampaignId = '{campaign_id}' LIMIT 1")
+        if existing.get("records"):
+            return {"success": False, "error": "Contact is already a member of this campaign"}
         member_data = {
             "ContactId": contact_id,
             "CampaignId": campaign_id
@@ -244,8 +281,101 @@ def add_contact_to_campaign(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any
     except Exception as e:
         error_msg = str(e)
         print(f"[CampaignMember ERROR] {error_msg}", file=sys.stderr)
-        return {
-            "success": False,
-            "error": error_msg
-        }
+        return {"success": False, "error": error_msg}
+
+
+def delete_contact(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        contact_id = arguments.get("contact_id")
+        if not contact_id:
+            raise ValueError("contact_id is required")
+        con_sf = SFType("Contact", sf.session_id, sf.sf_instance)
+        con_sf.delete(contact_id)
+        return {"success": True, "message": "Contact deleted"}
+    except Exception as e:
+        print(f"[Contact ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+def get_contact(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        contact_id = arguments.get("contact_id")
+        if not contact_id:
+            raise ValueError("contact_id is required")
+        con_sf = SFType("Contact", sf.session_id, sf.sf_instance)
+        rec = con_sf.get(contact_id)
+        return {"success": True, "record": rec}
+    except Exception as e:
+        print(f"[Contact ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+def list_contacts(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        query = arguments.get("query") or "SELECT Id, Name, Email, AccountId FROM Contact LIMIT 2000"
+        result = sf.query(str(query).strip())
+        return {"success": True, "records": result.get("records", []), "totalSize": result.get("totalSize", 0), "done": result.get("done", True), "nextRecordsUrl": result.get("nextRecordsUrl")}
+    except Exception as e:
+        print(f"[Contact ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+def _escape_soql(s: str) -> str:
+    return str(s).replace("'", "''")
+
+
+def search_contacts(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        limit = min(int(arguments.get("limit", 50)), 200)
+        fields = arguments.get("fields") or "Id, Name, Email, Phone, Title, AccountId"
+        where = []
+        if arguments.get("name"):
+            where.append(f"Name LIKE '%{_escape_soql(arguments['name'])}%'")
+        if arguments.get("email"):
+            where.append(f"Email LIKE '%{_escape_soql(arguments['email'])}%'")
+        if arguments.get("phone"):
+            where.append(f"Phone LIKE '%{_escape_soql(arguments['phone'])}%'")
+        if arguments.get("title"):
+            where.append(f"Title LIKE '%{_escape_soql(arguments['title'])}%'")
+        if arguments.get("account_name"):
+            where.append(f"AccountId IN (SELECT Id FROM Account WHERE Name LIKE '%{_escape_soql(arguments['account_name'])}%')")
+        where_clause = " AND ".join(where) if where else "Id != null"
+        query = f"SELECT {fields} FROM Contact WHERE {where_clause} LIMIT {limit}"
+        result = sf.query(query)
+        return {"success": True, "records": result.get("records", []), "totalSize": result.get("totalSize", 0)}
+    except Exception as e:
+        print(f"[Contact ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+CONTACT_UPDATE_MAP = {
+    "first_name": "FirstName", "last_name": "LastName", "email": "Email", "phone": "Phone", "mobile_phone": "MobilePhone",
+    "title": "Title", "department": "Department", "birthdate": "Birthdate", "account_id": "AccountId", "description": "Description",
+    "mailing_street": "MailingStreet", "mailing_city": "MailingCity", "mailing_state": "MailingState",
+    "mailing_postal_code": "MailingPostalCode", "mailing_country": "MailingCountry",
+}
+
+
+def update_contact(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        contact_id = arguments.get("contact_id")
+        if not contact_id:
+            raise ValueError("contact_id is required")
+        update_data = {}
+        for k, sf_field in CONTACT_UPDATE_MAP.items():
+            v = arguments.get(k)
+            if v is not None:
+                update_data[sf_field] = v
+        custom = arguments.get("custom_fields", {})
+        if custom:
+            update_data.update(custom)
+        if not update_data:
+            return {"success": True, "message": "No fields to update"}
+        con_sf = SFType("Contact", sf.session_id, sf.sf_instance)
+        con_sf.update(contact_id, update_data)
+        return {"success": True, "contact_id": contact_id, "message": "Contact updated"}
+    except Exception as e:
+        print(f"[Contact ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
 

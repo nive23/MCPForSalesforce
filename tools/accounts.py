@@ -126,19 +126,112 @@ def get_account_tools() -> List[Dict[str, Any]]:
                     }
                 }
             }
+        },
+        {
+            "name": "SALESFORCE_DELETE_ACCOUNT",
+            "description": "Permanently deletes an account from Salesforce. This action cannot be undone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string", "description": "Account ID (required)"}
+                },
+                "required": ["account_id"]
+            }
+        },
+        {
+            "name": "SALESFORCE_GET_ACCOUNT",
+            "description": "Retrieves a specific account by ID from Salesforce, returning all available fields.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string", "description": "Account ID (required)"}
+                },
+                "required": ["account_id"]
+            }
+        },
+        {
+            "name": "SALESFORCE_LIST_ACCOUNTS",
+            "description": "Lists accounts from Salesforce using SOQL query, allowing flexible filtering, sorting, and field selection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "SOQL query (e.g. SELECT Id, Name FROM Account LIMIT 100)"}
+                }
+            }
+        },
+        {
+            "name": "SALESFORCE_SEARCH_ACCOUNTS",
+            "description": "Search for Salesforce accounts using criteria like name, industry, type, location.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string"},
+                    "industry": {"type": "string"},
+                    "phone": {"type": "string"},
+                    "website": {"type": "string"},
+                    "billing_city": {"type": "string"},
+                    "billing_state": {"type": "string"},
+                    "billing_country": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Max results (default 50)"},
+                    "fields": {"type": "string", "description": "Comma-separated field names"}
+                }
+            }
+        },
+        {
+            "name": "SALESFORCE_UPDATE_ACCOUNT",
+            "description": "Updates an existing account in Salesforce with the specified changes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string", "description": "Account ID (required)"},
+                    "name": {"type": "string"},
+                    "type": {"type": "string"},
+                    "phone": {"type": "string"},
+                    "website": {"type": "string"},
+                    "industry": {"type": "string"},
+                    "sic_desc": {"type": "string"},
+                    "parent_id": {"type": "string"},
+                    "description": {"type": "string"},
+                    "billing_city": {"type": "string"},
+                    "billing_state": {"type": "string"},
+                    "billing_street": {"type": "string"},
+                    "billing_country": {"type": "string"},
+                    "billing_postal_code": {"type": "string"},
+                    "shipping_city": {"type": "string"},
+                    "shipping_state": {"type": "string"},
+                    "shipping_street": {"type": "string"},
+                    "shipping_country": {"type": "string"},
+                    "shipping_postal_code": {"type": "string"},
+                    "account_source": {"type": "string"},
+                    "annual_revenue": {"type": "number"},
+                    "number_of_employees": {"type": "integer"},
+                    "fax": {"type": "string"},
+                    "custom_fields": {"type": "object"}
+                },
+                "required": ["account_id"]
+            }
         }
     ]
 
 def handle_account_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle account-related tool calls"""
     sf = get_salesforce()
-    
     if tool_name == "SALESFORCE_CREATE_ACCOUNT":
         return create_account(sf, arguments)
-    elif tool_name == "get_accounts":
+    if tool_name == "get_accounts":
         return get_accounts(sf, arguments)
-    else:
-        raise ValueError(f"Unknown account tool: {tool_name}")
+    if tool_name == "SALESFORCE_DELETE_ACCOUNT":
+        return delete_account(sf, arguments)
+    if tool_name == "SALESFORCE_GET_ACCOUNT":
+        return get_account(sf, arguments)
+    if tool_name == "SALESFORCE_LIST_ACCOUNTS":
+        return list_accounts(sf, arguments)
+    if tool_name == "SALESFORCE_SEARCH_ACCOUNTS":
+        return search_accounts(sf, arguments)
+    if tool_name == "SALESFORCE_UPDATE_ACCOUNT":
+        return update_account(sf, arguments)
+    raise ValueError(f"Unknown account tool: {tool_name}")
 
 # Map our snake_case field names to Salesforce Account API names (PascalCase)
 ACCOUNT_FIELD_TO_API = {
@@ -215,23 +308,118 @@ def get_accounts(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         limit = arguments.get("limit", 5)
         if limit < 1 or limit > 100:
             limit = 5
-        
-        print(f"[Accounts] Fetching {limit} accounts...", file=sys.stderr)
         result = sf.query(f"SELECT Id, Name FROM Account LIMIT {limit}")
         accounts = result.get("records", [])
-        
-        return {
-            "success": True,
-            "accounts": accounts,
-            "count": len(accounts)
-        }
-    
+        return {"success": True, "accounts": accounts, "count": len(accounts)}
     except Exception as e:
         error_msg = str(e)
         print(f"[Accounts ERROR] {error_msg}", file=sys.stderr)
+        return {"success": False, "error": error_msg}
+
+
+def delete_account(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        account_id = arguments.get("account_id")
+        if not account_id:
+            raise ValueError("account_id is required")
+        acc_sf = SFType("Account", sf.session_id, sf.sf_instance)
+        acc_sf.delete(account_id)
+        return {"success": True, "message": "Account deleted"}
+    except Exception as e:
+        print(f"[Account ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+def get_account(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        account_id = arguments.get("account_id")
+        if not account_id:
+            raise ValueError("account_id is required")
+        acc_sf = SFType("Account", sf.session_id, sf.sf_instance)
+        rec = acc_sf.get(account_id)
+        return {"success": True, "record": rec}
+    except Exception as e:
+        print(f"[Account ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+def list_accounts(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        query = arguments.get("query")
+        if not query:
+            query = "SELECT Id, Name FROM Account LIMIT 2000"
+        result = sf.query(str(query).strip())
         return {
-            "success": False,
-            "error": error_msg
+            "success": True,
+            "records": result.get("records", []),
+            "totalSize": result.get("totalSize", 0),
+            "done": result.get("done", True),
+            "nextRecordsUrl": result.get("nextRecordsUrl"),
         }
+    except Exception as e:
+        print(f"[Accounts ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+def _build_account_soql_where(params: Dict[str, Any]) -> List[str]:
+    where = []
+    if params.get("name"):
+        where.append(f"Name LIKE '%{str(params['name']).replace(chr(39), chr(39)+chr(39))}%'")
+    if params.get("type"):
+        where.append(f"Type = '{str(params['type']).replace(chr(39), chr(39)+chr(39))}'")
+    if params.get("industry"):
+        where.append(f"Industry LIKE '%{str(params['industry']).replace(chr(39), chr(39)+chr(39))}%'")
+    if params.get("phone"):
+        where.append(f"Phone LIKE '%{str(params['phone']).replace(chr(39), chr(39)+chr(39))}%'")
+    if params.get("website"):
+        where.append(f"Website LIKE '%{str(params['website']).replace(chr(39), chr(39)+chr(39))}%'")
+    if params.get("billing_city"):
+        where.append(f"BillingCity LIKE '%{str(params['billing_city']).replace(chr(39), chr(39)+chr(39))}%'")
+    if params.get("billing_state"):
+        where.append(f"BillingState LIKE '%{str(params['billing_state']).replace(chr(39), chr(39)+chr(39))}%'")
+    if params.get("billing_country"):
+        where.append(f"BillingCountry LIKE '%{str(params['billing_country']).replace(chr(39), chr(39)+chr(39))}%'")
+    return where
+
+
+def search_accounts(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        limit = min(int(arguments.get("limit", 50)), 200)
+        fields = arguments.get("fields") or "Id, Name, Type, Industry, Phone, BillingCity, BillingState, BillingCountry"
+        where = _build_account_soql_where(arguments)
+        where_clause = " AND ".join(where) if where else "Id != null"
+        query = f"SELECT {fields} FROM Account WHERE {where_clause} LIMIT {limit}"
+        result = sf.query(query)
+        return {"success": True, "records": result.get("records", []), "totalSize": result.get("totalSize", 0)}
+    except Exception as e:
+        print(f"[Accounts ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
+
+
+def update_account(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        account_id = arguments.get("account_id")
+        if not account_id:
+            raise ValueError("account_id is required")
+        update_data = {}
+        for field, sf_field in ACCOUNT_FIELD_TO_API.items():
+            if field == "parent_id":
+                continue
+            v = arguments.get(field)
+            if v is not None:
+                update_data[sf_field] = v
+        if arguments.get("parent_id") is not None:
+            update_data["ParentId"] = arguments["parent_id"]
+        custom = arguments.get("custom_fields", {})
+        if custom:
+            update_data.update(custom)
+        if not update_data:
+            return {"success": True, "message": "No fields to update"}
+        acc_sf = SFType("Account", sf.session_id, sf.sf_instance)
+        acc_sf.update(account_id, update_data)
+        return {"success": True, "account_id": account_id, "message": "Account updated"}
+    except Exception as e:
+        print(f"[Account ERROR] {e}", file=sys.stderr)
+        return {"success": False, "error": str(e)}
 
 

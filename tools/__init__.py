@@ -11,6 +11,10 @@ from .leads import get_lead_tools, handle_lead_tool_call
 from .campaigns import get_campaign_tools, handle_campaign_tool_call
 from .opportunities import get_opportunity_tools, handle_opportunity_tool_call
 from .tasks import get_task_tools, handle_task_tool_call
+from .soql import get_soql_tools, handle_soql_tool_call
+from .reports import get_report_tools, handle_report_tool_call
+from .user import get_user_tools, handle_user_tool_call
+from .email import get_email_tools, handle_email_tool_call
 
 def _load_note_tools():
     # 1) Normal import (tools/notes.py)
@@ -62,6 +66,10 @@ __all__ = [
     'get_task_tools', 'handle_task_tool_call',
     'get_note_tools', 'handle_note_tool_call',
     'get_quote_tools', 'handle_quote_tool_call',
+    'get_soql_tools', 'handle_soql_tool_call',
+    'get_report_tools', 'handle_report_tool_call',
+    'get_user_tools', 'handle_user_tool_call',
+    'get_email_tools', 'handle_email_tool_call',
 ]
 
 
