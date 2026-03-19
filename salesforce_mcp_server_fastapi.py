@@ -26,6 +26,10 @@ from tools import (
     get_task_tools, handle_task_tool_call,
     get_note_tools, handle_note_tool_call,
     get_quote_tools, handle_quote_tool_call,
+    get_soql_tools, handle_soql_tool_call,
+    get_report_tools, handle_report_tool_call,
+    get_user_tools, handle_user_tool_call,
+    get_email_tools, handle_email_tool_call,
 )
 
 # -------------------------------------------------
@@ -71,44 +75,46 @@ def get_all_tools() -> list:
     tools.extend(get_task_tools())
     tools.extend(get_note_tools())
     tools.extend(get_quote_tools())
+    tools.extend(get_soql_tools())
+    tools.extend(get_report_tools())
+    tools.extend(get_user_tools())
+    tools.extend(get_email_tools())
     return tools
 
 def handle_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Route tool calls to appropriate handler"""
-    # Account tools
-    if tool_name in ["SALESFORCE_CREATE_ACCOUNT", "get_accounts"]:
+    account_tools = ["SALESFORCE_CREATE_ACCOUNT", "get_accounts", "SALESFORCE_DELETE_ACCOUNT", "SALESFORCE_GET_ACCOUNT", "SALESFORCE_LIST_ACCOUNTS", "SALESFORCE_SEARCH_ACCOUNTS", "SALESFORCE_UPDATE_ACCOUNT"]
+    if tool_name in account_tools:
         return handle_account_tool_call(tool_name, arguments)
-    
-    # Contact tools
-    elif tool_name in ["SALESFORCE_CREATE_CONTACT", "SALESFORCE_ADD_CONTACT_TO_CAMPAIGN"]:
+    contact_tools = ["SALESFORCE_CREATE_CONTACT", "SALESFORCE_ADD_CONTACT_TO_CAMPAIGN", "SALESFORCE_DELETE_CONTACT", "SALESFORCE_GET_CONTACT", "SALESFORCE_LIST_CONTACTS", "SALESFORCE_SEARCH_CONTACTS", "SALESFORCE_UPDATE_CONTACT"]
+    if tool_name in contact_tools:
         return handle_contact_tool_call(tool_name, arguments)
-    
-    # Lead tools
-    elif tool_name in ["SALESFORCE_CREATE_LEAD", "SALESFORCE_ADD_LEAD_TO_CAMPAIGN"]:
+    lead_tools = ["SALESFORCE_CREATE_LEAD", "SALESFORCE_ADD_LEAD_TO_CAMPAIGN", "SALESFORCE_DELETE_LEAD", "SALESFORCE_GET_LEAD", "SALESFORCE_LIST_LEADS", "SALESFORCE_SEARCH_LEADS", "SALESFORCE_UPDATE_LEAD"]
+    if tool_name in lead_tools:
         return handle_lead_tool_call(tool_name, arguments)
-    
-    # Campaign tools
-    elif tool_name == "SALESFORCE_CREATE_CAMPAIGN":
+    campaign_tools = ["SALESFORCE_CREATE_CAMPAIGN", "SALESFORCE_DELETE_CAMPAIGN", "SALESFORCE_GET_CAMPAIGN", "SALESFORCE_LIST_CAMPAIGNS", "SALESFORCE_SEARCH_CAMPAIGNS", "SALESFORCE_UPDATE_CAMPAIGN", "SALESFORCE_REMOVE_FROM_CAMPAIGN"]
+    if tool_name in campaign_tools:
         return handle_campaign_tool_call(tool_name, arguments)
-    
-    # Opportunity tools
-    elif tool_name == "SALESFORCE_CREATE_OPPORTUNITY":
+    opportunity_tools = ["SALESFORCE_CREATE_OPPORTUNITY", "SALESFORCE_GET_OPPORTUNITY", "SALESFORCE_LIST_OPPORTUNITIES", "SALESFORCE_SEARCH_OPPORTUNITIES", "SALESFORCE_UPDATE_OPPORTUNITY"]
+    if tool_name in opportunity_tools:
         return handle_opportunity_tool_call(tool_name, arguments)
-    
-    # Task tools
-    elif tool_name in ["SALESFORCE_CREATE_TASK", "SALESFORCE_COMPLETE_TASK"]:
+    task_tools = ["SALESFORCE_CREATE_TASK", "SALESFORCE_COMPLETE_TASK", "SALESFORCE_UPDATE_TASK", "SALESFORCE_SEARCH_TASKS", "SALESFORCE_LOG_CALL"]
+    if tool_name in task_tools:
         return handle_task_tool_call(tool_name, arguments)
-    
-    # Note tools
-    elif tool_name == "SALESFORCE_CREATE_NOTE":
+    note_tools = ["SALESFORCE_CREATE_NOTE", "SALESFORCE_LIST_NOTES", "SALESFORCE_SEARCH_NOTES", "SALESFORCE_UPDATE_NOTE"]
+    if tool_name in note_tools:
         return handle_note_tool_call(tool_name, arguments)
-    
-    # Quote tools
-    elif tool_name == "create_quote_from_opportunity":
+    if tool_name == "create_quote_from_opportunity":
         return handle_quote_tool_call(tool_name, arguments)
-    
-    else:
-        raise ValueError(f"Unknown tool: {tool_name}")
+    if tool_name == "SALESFORCE_RUN_SOQL_QUERY":
+        return handle_soql_tool_call(tool_name, arguments)
+    if tool_name in ["SALESFORCE_LIST_REPORTS", "SALESFORCE_RUN_REPORT"]:
+        return handle_report_tool_call(tool_name, arguments)
+    if tool_name == "SALESFORCE_GET_USER_INFO":
+        return handle_user_tool_call(tool_name, arguments)
+    if tool_name in ["SALESFORCE_LOG_EMAIL_ACTIVITY", "SALESFORCE_SEND_EMAIL", "SALESFORCE_SEND_MASS_EMAIL"]:
+        return handle_email_tool_call(tool_name, arguments)
+    raise ValueError(f"Unknown tool: {tool_name}")
 
 # -------------------------------------------------
 # MCP Protocol Endpoints
@@ -489,4 +495,5 @@ if __name__ == "__main__":
     print("=" * 60, file=sys.stderr)
     
     uvicorn.run(app, host=host, port=port, log_level="info")
+
 
