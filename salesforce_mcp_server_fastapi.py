@@ -81,8 +81,20 @@ def get_all_tools() -> list:
     tools.extend(get_email_tools())
     return tools
 
+def _normalize_mcp_tool_name(name: str) -> str:
+    """Strip whitespace, collapse spaces to underscores, uppercase SALESFORCE_* tools."""
+    raw = str(name).strip() if name else ""
+    if not raw:
+        return raw
+    compact = "_".join(raw.split())
+    if compact.upper().startswith("SALESFORCE_"):
+        return compact.upper()
+    return compact
+
+
 def handle_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Route tool calls to appropriate handler"""
+    tool_name = _normalize_mcp_tool_name(tool_name)
     account_tools = ["SALESFORCE_CREATE_ACCOUNT", "get_accounts", "SALESFORCE_DELETE_ACCOUNT", "SALESFORCE_GET_ACCOUNT", "SALESFORCE_LIST_ACCOUNTS", "SALESFORCE_SEARCH_ACCOUNTS", "SALESFORCE_UPDATE_ACCOUNT"]
     if tool_name in account_tools:
         return handle_account_tool_call(tool_name, arguments)
@@ -408,19 +420,9 @@ async def mcp_request(request: Request):
             
             # Call the appropriate tool handler
             result = handle_tool_call(tool_name, arguments)
-            
-            # Format response based on result structure
-            if isinstance(result, dict) and "success" in result:
-                # Tool returned a structured result
-                if result.get("success"):
-                    response_text = json.dumps(result, indent=2)
-                else:
-                    # Error occurred
-                    error_msg = result.get("error", "Unknown error")
-                    raise ValueError(error_msg)
-            else:
-                # Tool returned raw result (like quote logic)
-                response_text = json.dumps(result, indent=2)
+            # Always return JSON in result.content, including {"success": false, "error": "..."}.
+            # Raising on tool failures hid real Salesforce errors behind generic JSON-RPC errors.
+            response_text = json.dumps(result, indent=2)
             
             return {
                 "jsonrpc": "2.0",
