@@ -8,9 +8,13 @@ from typing import Dict, Any, List, Optional, Tuple
 from xml.sax.saxutils import escape
 
 from simple_salesforce import SFType
-from simple_salesforce.exceptions import SalesforceResourceNotFound
+from simple_salesforce.exceptions import (
+    SalesforceError,
+    SalesforceExpiredSession,
+    SalesforceResourceNotFound,
+)
 
-from salesforce_config import get_salesforce
+from salesforce_config import get_salesforce, invalidate_salesforce_session
 
 # Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
 LEAD_PRODUCT_OBJECT = "Lead_Product__c"
@@ -542,6 +546,20 @@ def _convert_lead_soap(
     return acc_id, con_id, opp_id
 
 
+def _salesforce_session_should_retry(exc: BaseException) -> bool:
+    """True when a fresh JWT login may fix the failure (SOAP fault or REST 401)."""
+    if isinstance(exc, SalesforceExpiredSession):
+        return True
+    if isinstance(exc, SalesforceError) and getattr(exc, "status", None) == 401:
+        return True
+    msg = str(exc).upper()
+    if "INVALID_SESSION_ID" in msg:
+        return True
+    if "SESSION_EXPIRED" in msg or "INSUFFICIENT_SESSION" in msg:
+        return True
+    return False
+
+
 def _soap_gather_messages(root: ET.Element) -> List[str]:
     out: List[str] = []
     for el in root.iter():
@@ -643,86 +661,119 @@ def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str)
     return {"line_items_created": line_items_created, "notes": notes}
 
 
+def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
+    """
+    Single attempt: REST LeadConvert or SOAP fallback, then post-convert steps.
+    Raises on failure so caller can retry after session refresh.
+    """
+    lead_sf = SFType("Lead", sf.session_id, sf.sf_instance)
+    lead_row = lead_sf.get(lead_id)
+    first = (lead_row.get("FirstName") or "").strip()
+    last = (lead_row.get("LastName") or "").strip()
+    lead_name = (lead_row.get("Name") or f"{first} {last}".strip() or "Lead").strip()
+
+    converted_status = "Converted"
+    opportunity_name = lead_name
+
+    payload: Dict[str, Any] = {
+        "convertedStatus": str(converted_status).strip(),
+        "overwriteLeadSource": False,
+        "sendNotificationEmail": False,
+        "doNotCreateOpportunity": False,
+        "opportunityName": str(opportunity_name).strip(),
+    }
+
+    path = f"sobjects/Lead/{lead_id}/actions/quick/LeadConvert"
+    convert_via = "rest"
+    acc_id: Optional[str] = None
+    con_id: Optional[str] = None
+    opp_id: Optional[str] = None
+    try:
+        raw = sf.restful(path, method="POST", json=payload)
+        acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
+    except SalesforceResourceNotFound:
+        convert_via = "soap"
+        acc_id, con_id, opp_id = _convert_lead_soap(
+            sf, str(lead_id), converted_status, str(opportunity_name).strip()
+        )
+
+    if not acc_id and not con_id:
+        raise RuntimeError("Lead convert returned no account or contact id")
+    if not opp_id:
+        raise RuntimeError(
+            "Lead convert did not return an opportunity id; ensure the org allows creating "
+            "an opportunity on convert (this tool always requests one)."
+        )
+
+    result: Dict[str, Any] = {
+        "success": True,
+        "account_id": acc_id,
+        "contact_id": con_id,
+        "opportunity_id": opp_id,
+        "converted_status": converted_status,
+        "opportunity_name": opportunity_name,
+        "convert_via": convert_via,
+    }
+
+    try:
+        extras = _post_convert_opportunity_extras(sf, lead_id, opp_id)
+        result["line_items_created"] = extras["line_items_created"]
+        if extras.get("notes"):
+            result["notes"] = extras["notes"]
+    except Exception as post_ex:
+        result["post_convert_warning"] = str(post_ex)
+        result["line_items_created"] = 0
+
+    print(f"[Lead] Converted lead {lead_id} -> account={acc_id} contact={con_id} opp={opp_id}", file=sys.stderr)
+    return result
+
+
 def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
     Convert a lead via REST quick action LeadConvert: always new Account/Contact, always Opportunity,
     then standard price book, platform event, and Lead_Product__c line items.
+    Retries once after a fresh JWT login if the session is invalid (SOAP/REST).
     """
-    try:
-        lead_id = arguments.get("lead_id")
-        if not lead_id:
-            raise ValueError("Lead Id cannot be null")
-
-        lead_sf = SFType("Lead", sf.session_id, sf.sf_instance)
-        lead_row = lead_sf.get(lead_id)
-        first = (lead_row.get("FirstName") or "").strip()
-        last = (lead_row.get("LastName") or "").strip()
-        lead_name = (lead_row.get("Name") or f"{first} {last}".strip() or "Lead").strip()
-
-        converted_status = "Converted"
-        opportunity_name = lead_name
-
-        payload: Dict[str, Any] = {
-            "convertedStatus": str(converted_status).strip(),
-            "overwriteLeadSource": False,
-            "sendNotificationEmail": False,
-            "doNotCreateOpportunity": False,
-            "opportunityName": str(opportunity_name).strip(),
-        }
-
-        path = f"sobjects/Lead/{lead_id}/actions/quick/LeadConvert"
-        convert_via = "rest"
-        acc_id: Optional[str] = None
-        con_id: Optional[str] = None
-        opp_id: Optional[str] = None
-        try:
-            raw = sf.restful(path, method="POST", json=payload)
-            acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
-        except SalesforceResourceNotFound:
-            convert_via = "soap"
-            acc_id, con_id, opp_id = _convert_lead_soap(
-                sf, str(lead_id), converted_status, str(opportunity_name).strip()
-            )
-
-        if not acc_id and not con_id:
-            raise RuntimeError("Lead convert returned no account or contact id")
-        if not opp_id:
-            raise RuntimeError(
-                "Lead convert did not return an opportunity id; ensure the org allows creating "
-                "an opportunity on convert (this tool always requests one)."
-            )
-
-        result: Dict[str, Any] = {
-            "success": True,
-            "account_id": acc_id,
-            "contact_id": con_id,
-            "opportunity_id": opp_id,
-            "converted_status": converted_status,
-            "opportunity_name": opportunity_name,
-            "convert_via": convert_via,
-        }
-
-        try:
-            extras = _post_convert_opportunity_extras(sf, lead_id, opp_id)
-            result["line_items_created"] = extras["line_items_created"]
-            if extras.get("notes"):
-                result["notes"] = extras["notes"]
-        except Exception as post_ex:
-            result["post_convert_warning"] = str(post_ex)
-            result["line_items_created"] = 0
-
-        print(f"[Lead] Converted lead {lead_id} -> account={acc_id} contact={con_id} opp={opp_id}", file=sys.stderr)
-        return result
-
-    except Exception as e:
-        err = str(e)
-        print(f"[Lead ERROR] convert_lead: {err}", file=sys.stderr)
+    lead_id = arguments.get("lead_id")
+    if not lead_id:
         return {
             "success": False,
-            "error": err,
+            "error": "Lead Id cannot be null",
             "account_id": None,
             "contact_id": None,
             "opportunity_id": None,
         }
+
+    lid = str(lead_id)
+    for attempt in range(2):
+        try:
+            if attempt > 0:
+                invalidate_salesforce_session()
+                sf = get_salesforce()
+            return _convert_lead_execute(sf, lid)
+        except Exception as e:
+            if attempt == 0 and _salesforce_session_should_retry(e):
+                print(
+                    "[Lead] Salesforce session invalid; clearing cache and retrying convert once...",
+                    file=sys.stderr,
+                )
+                continue
+            err = str(e)
+            print(f"[Lead ERROR] convert_lead: {err}", file=sys.stderr)
+            return {
+                "success": False,
+                "error": err,
+                "account_id": None,
+                "contact_id": None,
+                "opportunity_id": None,
+            }
+
+    return {
+        "success": False,
+        "error": "Convert failed after session retry",
+        "account_id": None,
+        "contact_id": None,
+        "opportunity_id": None,
+    }
 
 
