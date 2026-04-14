@@ -218,7 +218,7 @@ def handle_lead_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str
         return search_leads(sf, arguments)
     if tool_name == "SALESFORCE_UPDATE_LEAD":
         return update_lead(sf, arguments)
-    if tool_name == "select Id,ovcSAPMaterialNumber__c from Product2 ":
+    if tool_name == "SALESFORCE_CONVERT_LEAD":
         return convert_lead(sf, arguments)
     raise ValueError(f"Unknown lead tool: {tool_name}")
 
