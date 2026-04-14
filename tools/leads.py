@@ -3,8 +3,13 @@ Lead Operations
 Handles Salesforce Lead creation, campaign membership, and lead conversion
 """
 import sys
+import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Optional, Tuple
+from xml.sax.saxutils import escape
+
 from simple_salesforce import SFType
+from simple_salesforce.exceptions import SalesforceResourceNotFound
+
 from salesforce_config import get_salesforce
 
 # Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
@@ -182,7 +187,9 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                 "Converts a lead with a fixed business flow: always creates a new Account and Contact, "
                 "always creates an Opportunity named after the lead, overwriteLeadSource=false, "
                 "no owner notification email, converted status 'Converted', then standard price book, "
-                "Lead_Product__c line items, and Opportunity_PlatformEvent__e."
+                "Lead_Product__c line items, and Opportunity_PlatformEvent__e. "
+                "Uses REST LeadConvert quick action when available; if that returns 404, falls back to "
+                "SOAP Partner API convertLead (same as Database.convertLead)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -443,6 +450,108 @@ def update_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 
+def _soap_local_tag(tag: str) -> str:
+    if not tag:
+        return ""
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _convert_lead_soap(
+    sf: Any,
+    lead_id: str,
+    converted_status: str,
+    opportunity_name: str,
+) -> Tuple[str, str, str]:
+    """
+    Partner SOAP API convertLead — works when REST .../actions/quick/LeadConvert is not available (404).
+    """
+    sid = escape(str(sf.session_id), entities={"'": "&apos;", '"': "&quot;"})
+    lid = escape(str(lead_id), entities={"'": "&apos;", '"': "&quot;"})
+    cst = escape(str(converted_status), entities={"'": "&apos;", '"': "&quot;"})
+    onm = escape(str(opportunity_name), entities={"'": "&apos;", '"': "&quot;"})
+    ver = sf.sf_version
+    host = sf.sf_instance
+    url = f"https://{host}/services/Soap/u/{ver}"
+    envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:partner.soap.sforce.com">
+  <soapenv:Header>
+    <urn:SessionHeader>
+      <urn:sessionId>{sid}</urn:sessionId>
+    </urn:SessionHeader>
+  </soapenv:Header>
+  <soapenv:Body>
+    <urn:convertLead>
+      <urn:leadConverts>
+        <urn:leadId>{lid}</urn:leadId>
+        <urn:convertedStatus>{cst}</urn:convertedStatus>
+        <urn:doNotCreateOpportunity>false</urn:doNotCreateOpportunity>
+        <urn:overwriteLeadSource>false</urn:overwriteLeadSource>
+        <urn:sendNotificationEmail>false</urn:sendNotificationEmail>
+        <urn:opportunityName>{onm}</urn:opportunityName>
+      </urn:leadConverts>
+    </urn:convertLead>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    headers = {
+        "Content-Type": "text/xml; charset=UTF-8",
+        "SOAPAction": '""',
+    }
+    resp = sf.session.post(url, data=envelope.encode("utf-8"), headers=headers, timeout=120)
+    if resp.status_code >= 300:
+        raise RuntimeError(f"SOAP convertLead HTTP {resp.status_code}: {resp.text[:2500]}")
+
+    root = ET.fromstring(resp.content)
+    fault = None
+    for el in root.iter():
+        if _soap_local_tag(el.tag) == "faultstring" and el.text:
+            fault = el.text.strip()
+            break
+    if fault:
+        raise RuntimeError(f"SOAP fault: {fault}")
+
+    result_maps: List[Dict[str, str]] = []
+    for el in root.iter():
+        if _soap_local_tag(el.tag) != "result":
+            continue
+        row: Dict[str, str] = {}
+        for child in el:
+            ln = _soap_local_tag(child.tag)
+            if child.text is not None and str(child.text).strip():
+                row[ln] = str(child.text).strip()
+        if row:
+            result_maps.append(row)
+
+    if not result_maps:
+        raise RuntimeError(f"SOAP convertLead: no result element in response: {resp.text[:2500]}")
+
+    r0 = result_maps[0]
+    if str(r0.get("success", "")).lower() != "true":
+        msgs = [m for m in (_soap_gather_messages(root)) if m]
+        detail = "; ".join(msgs) if msgs else str(r0)
+        raise RuntimeError(f"SOAP convertLead failed: {detail}")
+
+    acc_id = r0.get("accountId")
+    con_id = r0.get("contactId")
+    opp_id = r0.get("opportunityId")
+    if not acc_id or not con_id:
+        raise RuntimeError(f"SOAP convertLead missing account/contact: {r0}")
+    if not opp_id:
+        raise RuntimeError(
+            "SOAP convertLead did not return opportunityId; org may block opportunity on convert."
+        )
+    return acc_id, con_id, opp_id
+
+
+def _soap_gather_messages(root: ET.Element) -> List[str]:
+    out: List[str] = []
+    for el in root.iter():
+        if _soap_local_tag(el.tag) == "message" and el.text:
+            t = el.text.strip()
+            if t:
+                out.append(t)
+    return out
+
+
 def _parse_lead_convert_response(resp: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Normalize Lead Convert quick-action JSON into account/contact/opportunity ids."""
     if resp is None:
@@ -562,13 +671,21 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         }
 
         path = f"sobjects/Lead/{lead_id}/actions/quick/LeadConvert"
-        raw = sf.restful(path, method="POST", json=payload)
+        convert_via = "rest"
+        acc_id: Optional[str] = None
+        con_id: Optional[str] = None
+        opp_id: Optional[str] = None
+        try:
+            raw = sf.restful(path, method="POST", json=payload)
+            acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
+        except SalesforceResourceNotFound:
+            convert_via = "soap"
+            acc_id, con_id, opp_id = _convert_lead_soap(
+                sf, str(lead_id), converted_status, str(opportunity_name).strip()
+            )
 
-        acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
         if not acc_id and not con_id:
-            if isinstance(raw, dict) and raw.get("message"):
-                raise RuntimeError(str(raw.get("message")))
-            raise RuntimeError(f"Lead convert returned unexpected response: {raw!r}")
+            raise RuntimeError("Lead convert returned no account or contact id")
         if not opp_id:
             raise RuntimeError(
                 "Lead convert did not return an opportunity id; ensure the org allows creating "
@@ -582,6 +699,7 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
             "opportunity_id": opp_id,
             "converted_status": converted_status,
             "opportunity_name": opportunity_name,
+            "convert_via": convert_via,
         }
 
         try:
