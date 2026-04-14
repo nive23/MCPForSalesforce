@@ -2,7 +2,6 @@
 Lead Operations
 Handles Salesforce Lead creation, campaign membership, and lead conversion
 """
-import os
 import sys
 from typing import Dict, Any, List, Optional, Tuple
 from simple_salesforce import SFType
@@ -182,8 +181,8 @@ def get_lead_tools() -> List[Dict[str, Any]]:
             "description": (
                 "Converts a lead with a fixed business flow: always creates a new Account and Contact, "
                 "always creates an Opportunity named after the lead, overwriteLeadSource=false, "
-                "no owner notification email, converted status from SF_DEFAULT_LEAD_CONVERTED_STATUS or org "
-                "defaults, then standard price book, Lead_Product__c line items, and Opportunity_PlatformEvent__e."
+                "no owner notification email, converted status 'Converted', then standard price book, "
+                "Lead_Product__c line items, and Opportunity_PlatformEvent__e."
             ),
             "inputSchema": {
                 "type": "object",
@@ -212,7 +211,7 @@ def handle_lead_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str
         return search_leads(sf, arguments)
     if tool_name == "SALESFORCE_UPDATE_LEAD":
         return update_lead(sf, arguments)
-    if tool_name == "SALESFORCE_CONVERT_LEAD":
+    if tool_name == "select Id,ovcSAPMaterialNumber__c from Product2 ":
         return convert_lead(sf, arguments)
     raise ValueError(f"Unknown lead tool: {tool_name}")
 
@@ -467,29 +466,6 @@ def _get_standard_pricebook_id(sf: Any) -> str:
     return recs[0]["Id"]
 
 
-def _resolve_converted_status(sf: Any, explicit: Optional[str]) -> str:
-    """Salesforce always needs a converted status; derive one if the caller only passes lead_id."""
-    if explicit and str(explicit).strip():
-        return str(explicit).strip()
-    env_default = os.getenv("SF_DEFAULT_LEAD_CONVERTED_STATUS")
-    if env_default and env_default.strip():
-        return env_default.strip()
-    res = sf.query(
-        "SELECT MasterLabel FROM LeadStatus WHERE IsConverted = true "
-        "ORDER BY SortOrder ASC NULLS LAST LIMIT 1"
-    )
-    recs = res.get("records") or []
-    if not recs:
-        raise RuntimeError(
-            "No converted LeadStatus found in org; set converted_status on the tool call "
-            "or SF_DEFAULT_LEAD_CONVERTED_STATUS in the environment."
-        )
-    label = recs[0].get("MasterLabel")
-    if not label:
-        raise RuntimeError("LeadStatus query returned no MasterLabel")
-    return str(label).strip()
-
-
 def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str) -> Dict[str, Any]:
     """Standard price book, mandatory platform event, Lead_Product__c -> OpportunityLineItem."""
     notes: List[str] = []
@@ -574,7 +550,7 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         last = (lead_row.get("LastName") or "").strip()
         lead_name = (lead_row.get("Name") or f"{first} {last}".strip() or "Lead").strip()
 
-        converted_status = _resolve_converted_status(sf, None)
+        converted_status = "Converted"
         opportunity_name = lead_name
 
         payload: Dict[str, Any] = {
