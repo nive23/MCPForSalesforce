@@ -1,12 +1,20 @@
 """
 Lead Operations
-Handles Salesforce Lead creation and campaign membership
+Handles Salesforce Lead creation, campaign membership, and lead conversion
 """
+import os
 import sys
-import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from simple_salesforce import SFType
 from salesforce_config import get_salesforce
+
+# Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
+LEAD_PRODUCT_OBJECT = "Lead_Product__c"
+LEAD_PRODUCT_LEAD_FIELD = "Lead__c"
+LEAD_PRODUCT_PRODUCT_FIELD = "Product__c"
+LEAD_PRODUCT_QUANTITY_FIELD = "Quantity__c"
+OPPORTUNITY_PLATFORM_EVENT_OBJECT = "Opportunity_PlatformEvent__e"
+OPPORTUNITY_PLATFORM_EVENT_OPP_FIELD = "OpportunityId__c"
 
 def get_lead_tools() -> List[Dict[str, Any]]:
     """Return list of lead-related MCP tools"""
@@ -23,15 +31,15 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                     },
                     "company": {
                         "type": "string",
-                        "description": "Company name (required)"
+                        "description": "Company name (optional). If omitted, a placeholder is sent so Salesforce orgs that require Company still accept the record."
                     },
                     "first_name": {
                         "type": "string",
-                        "description": "Lead first name"
+                        "description": "Lead first name (required)"
                     },
                     "email": {
                         "type": "string",
-                        "description": "Email address"
+                        "description": "Email address (required)"
                     },
                     "phone": {
                         "type": "string",
@@ -83,11 +91,11 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                     },
                     "annual_revenue": {
                         "type": "number",
-                        "description": "Annual revenue (e.g., 10000)"
+                        "description": "Annual revenue (required), numeric only e.g. 10000 for 10,000"
                     },
                     "product_description": {
                         "type": "string",
-                        "description": "Product description - stored in custom field Product_Description__c (e.g., One Basic Laptop Bundle). Always pass this when the user asks for product description."
+                        "description": "Product description (required) - stored in Product_Description__c (e.g., One Basic Laptop Bundle)."
                     },
                     "Product_Description__c": {
                         "type": "string",
@@ -98,7 +106,7 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                         "description": "Additional custom fields as key-value pairs"
                     }
                 },
-                "required": ["last_name", "company"]
+                "required": ["first_name", "last_name", "email", "annual_revenue", "product_description"]
             }
         },
         {
@@ -168,7 +176,23 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                 },
                 "required": ["lead_id"]
             }
-        }
+        },
+        {
+            "name": "SALESFORCE_CONVERT_LEAD",
+            "description": (
+                "Converts a lead with a fixed business flow: always creates a new Account and Contact, "
+                "always creates an Opportunity named after the lead, overwriteLeadSource=false, "
+                "no owner notification email, converted status from SF_DEFAULT_LEAD_CONVERTED_STATUS or org "
+                "defaults, then standard price book, Lead_Product__c line items, and Opportunity_PlatformEvent__e."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lead_id": {"type": "string", "description": "Lead Id (required); all other convert flags are fixed in code."},
+                },
+                "required": ["lead_id"],
+            },
+        },
     ]
 
 def handle_lead_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -188,60 +212,66 @@ def handle_lead_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str
         return search_leads(sf, arguments)
     if tool_name == "SALESFORCE_UPDATE_LEAD":
         return update_lead(sf, arguments)
+    if tool_name == "SALESFORCE_CONVERT_LEAD":
+        return convert_lead(sf, arguments)
     raise ValueError(f"Unknown lead tool: {tool_name}")
 
 def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new lead in Salesforce"""
     try:
-        # Extract required fields
         last_name = arguments.get("last_name")
-        company = arguments.get("company")
-        
-        if not last_name:
+        first_name = arguments.get("first_name")
+        email = arguments.get("email")
+        annual_revenue = arguments.get("annual_revenue")
+        product_description = arguments.get("product_description") or arguments.get("Product_Description__c")
+
+        if not last_name or not str(last_name).strip():
             raise ValueError("Lead last name is required")
+        if not first_name or not str(first_name).strip():
+            raise ValueError("Lead first name is required")
+        if not email or not str(email).strip():
+            raise ValueError("Email is required")
+        if annual_revenue is None:
+            raise ValueError("Annual revenue is required")
+        if not product_description or not str(product_description).strip():
+            raise ValueError("Product description is required")
+
+        company_raw = arguments.get("company")
+        company = str(company_raw).strip() if company_raw is not None else ""
         if not company:
-            raise ValueError("Company name is required")
-        
-        # Build lead data
+            company = "(Not specified)"
+
         lead_data = {
-            "LastName": last_name,
-            "Company": company
+            "LastName": str(last_name).strip(),
+            "FirstName": str(first_name).strip(),
+            "Company": company,
+            "Email": str(email).strip(),
+            "AnnualRevenue": annual_revenue,
+            "Product_Description__c": str(product_description).strip(),
         }
-        
-        # Add optional fields
+
         optional_fields = [
-            "first_name", "email", "phone", "title", "rating", "status",
+            "phone", "title", "rating", "status",
             "lead_source", "street", "city", "state", "postal_code",
-            "country", "website", "industry", "annual_revenue"
+            "country", "website", "industry"
         ]
         
         for field in optional_fields:
             value = arguments.get(field)
             if value is not None:
-                # Convert field name to Salesforce API name
-                sf_field = field[0].upper() + field[1:] if field else field
-                # Handle special cases
-                if field == "first_name":
-                    sf_field = "FirstName"
-                elif field == "last_name":
-                    sf_field = "LastName"
-                elif field == "lead_source":
+                if field == "lead_source":
                     sf_field = "LeadSource"
                 elif field == "postal_code":
                     sf_field = "PostalCode"
-                elif field == "annual_revenue":
-                    sf_field = "AnnualRevenue"
+                else:
+                    sf_field = field[0].upper() + field[1:] if field else field
                 lead_data[sf_field] = value
-        
-        # Add custom fields first
+
         custom_fields = arguments.get("custom_fields", {})
         if custom_fields:
             lead_data.update(custom_fields)
-        
-        # Product description -> custom field Product_Description__c (set after custom_fields so it is never overwritten)
-        product_description = arguments.get("product_description") or arguments.get("Product_Description__c")
-        if product_description is not None and str(product_description).strip():
-            lead_data["Product_Description__c"] = str(product_description).strip()
+
+        lead_data["Product_Description__c"] = str(product_description).strip()
         
         # Create lead
         lead_sf = SFType('Lead', sf.session_id, sf.sf_instance)
@@ -253,7 +283,7 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "success": True,
             "lead_id": lead_id,
-            "message": f"Lead '{last_name}' from '{company}' created successfully"
+            "message": f"Lead '{str(first_name).strip()} {str(last_name).strip()}' created successfully"
         }
     
     except Exception as e:
@@ -412,5 +442,193 @@ def update_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         print(f"[Lead ERROR] {e}", file=sys.stderr)
         return {"success": False, "error": str(e)}
+
+
+def _parse_lead_convert_response(resp: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Normalize Lead Convert quick-action JSON into account/contact/opportunity ids."""
+    if resp is None:
+        return None, None, None
+    data = resp[0] if isinstance(resp, list) and resp else resp
+    if not isinstance(data, dict):
+        return None, None, None
+    inner = data.get("outputValues") if isinstance(data.get("outputValues"), dict) else data
+    acc = inner.get("accountId") or inner.get("AccountId")
+    con = inner.get("contactId") or inner.get("ContactId")
+    opp = inner.get("opportunityId") or inner.get("OpportunityId")
+    return acc, con, opp
+
+
+def _get_standard_pricebook_id(sf: Any) -> str:
+    q = "SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1"
+    res = sf.query(q)
+    recs = res.get("records") or []
+    if not recs:
+        raise RuntimeError("No standard Pricebook2 found in org")
+    return recs[0]["Id"]
+
+
+def _resolve_converted_status(sf: Any, explicit: Optional[str]) -> str:
+    """Salesforce always needs a converted status; derive one if the caller only passes lead_id."""
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    env_default = os.getenv("SF_DEFAULT_LEAD_CONVERTED_STATUS")
+    if env_default and env_default.strip():
+        return env_default.strip()
+    res = sf.query(
+        "SELECT MasterLabel FROM LeadStatus WHERE IsConverted = true "
+        "ORDER BY SortOrder ASC NULLS LAST LIMIT 1"
+    )
+    recs = res.get("records") or []
+    if not recs:
+        raise RuntimeError(
+            "No converted LeadStatus found in org; set converted_status on the tool call "
+            "or SF_DEFAULT_LEAD_CONVERTED_STATUS in the environment."
+        )
+    label = recs[0].get("MasterLabel")
+    if not label:
+        raise RuntimeError("LeadStatus query returned no MasterLabel")
+    return str(label).strip()
+
+
+def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str) -> Dict[str, Any]:
+    """Standard price book, mandatory platform event, Lead_Product__c -> OpportunityLineItem."""
+    notes: List[str] = []
+    line_items_created = 0
+    standard_pb_id = _get_standard_pricebook_id(sf)
+    opp_sf = SFType("Opportunity", sf.session_id, sf.sf_instance)
+    opp_sf.update(opportunity_id, {"Pricebook2Id": standard_pb_id})
+
+    evt_sf = SFType(OPPORTUNITY_PLATFORM_EVENT_OBJECT, sf.session_id, sf.sf_instance)
+    evt_sf.create({OPPORTUNITY_PLATFORM_EVENT_OPP_FIELD: opportunity_id})
+
+    lp_q = (
+        f"SELECT {LEAD_PRODUCT_PRODUCT_FIELD}, {LEAD_PRODUCT_QUANTITY_FIELD} "
+        f"FROM {LEAD_PRODUCT_OBJECT} WHERE {LEAD_PRODUCT_LEAD_FIELD} = '{_lead_escape(lead_id)}'"
+    )
+    lp_res = sf.query(lp_q)
+
+    lead_products = lp_res.get("records") or []
+    if not lead_products:
+        return {"line_items_created": 0, "notes": notes}
+
+    opp_sf.update(opportunity_id, {"Pricebook2Id": standard_pb_id})
+
+    product_ids: List[str] = []
+    for row in lead_products:
+        pid = row.get(LEAD_PRODUCT_PRODUCT_FIELD)
+        if pid:
+            product_ids.append(pid)
+    if not product_ids:
+        return {"line_items_created": 0, "notes": notes}
+
+    in_list = ",".join(f"'{_lead_escape(x)}'" for x in product_ids)
+    pbe_q = (
+        f"SELECT Id, Product2Id, UnitPrice FROM PricebookEntry "
+        f"WHERE Pricebook2Id = '{_lead_escape(standard_pb_id)}' AND Product2Id IN ({in_list}) "
+        f"AND IsActive = true"
+    )
+    pbe_res = sf.query(pbe_q)
+    pbe_by_product: Dict[str, Dict[str, Any]] = {}
+    for pbe in pbe_res.get("records") or []:
+        pbe_by_product[pbe["Product2Id"]] = pbe
+
+    oli_sf = SFType("OpportunityLineItem", sf.session_id, sf.sf_instance)
+    for row in lead_products:
+        prod_id = row.get(LEAD_PRODUCT_PRODUCT_FIELD)
+        if not prod_id or prod_id not in pbe_by_product:
+            continue
+        pbe = pbe_by_product[prod_id]
+        qty = row.get(LEAD_PRODUCT_QUANTITY_FIELD)
+        if qty is None:
+            qty = 1
+        try:
+            qty = float(qty)
+        except (TypeError, ValueError):
+            qty = 1.0
+        oli_sf.create(
+            {
+                "OpportunityId": opportunity_id,
+                "PricebookEntryId": pbe["Id"],
+                "Quantity": qty,
+                "UnitPrice": pbe.get("UnitPrice") or 0,
+            }
+        )
+        line_items_created += 1
+
+    return {"line_items_created": line_items_created, "notes": notes}
+
+
+def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a lead via REST quick action LeadConvert: always new Account/Contact, always Opportunity,
+    then standard price book, platform event, and Lead_Product__c line items.
+    """
+    try:
+        lead_id = arguments.get("lead_id")
+        if not lead_id:
+            raise ValueError("Lead Id cannot be null")
+
+        lead_sf = SFType("Lead", sf.session_id, sf.sf_instance)
+        lead_row = lead_sf.get(lead_id)
+        first = (lead_row.get("FirstName") or "").strip()
+        last = (lead_row.get("LastName") or "").strip()
+        lead_name = (lead_row.get("Name") or f"{first} {last}".strip() or "Lead").strip()
+
+        converted_status = _resolve_converted_status(sf, None)
+        opportunity_name = lead_name
+
+        payload: Dict[str, Any] = {
+            "convertedStatus": str(converted_status).strip(),
+            "overwriteLeadSource": False,
+            "sendNotificationEmail": False,
+            "doNotCreateOpportunity": False,
+            "opportunityName": str(opportunity_name).strip(),
+        }
+
+        path = f"sobjects/Lead/{lead_id}/actions/quick/LeadConvert"
+        raw = sf.restful(path, method="POST", json=payload)
+
+        acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
+        if not acc_id and not con_id:
+            if isinstance(raw, dict) and raw.get("message"):
+                raise RuntimeError(str(raw.get("message")))
+            raise RuntimeError(f"Lead convert returned unexpected response: {raw!r}")
+        if not opp_id:
+            raise RuntimeError(
+                "Lead convert did not return an opportunity id; ensure the org allows creating "
+                "an opportunity on convert (this tool always requests one)."
+            )
+
+        result: Dict[str, Any] = {
+            "success": True,
+            "account_id": acc_id,
+            "contact_id": con_id,
+            "opportunity_id": opp_id,
+            "converted_status": converted_status,
+            "opportunity_name": opportunity_name,
+        }
+
+        try:
+            extras = _post_convert_opportunity_extras(sf, lead_id, opp_id)
+            result["line_items_created"] = extras["line_items_created"]
+            if extras.get("notes"):
+                result["notes"] = extras["notes"]
+        except Exception as post_ex:
+            result["post_convert_warning"] = str(post_ex)
+            result["line_items_created"] = 0
+
+        print(f"[Lead] Converted lead {lead_id} -> account={acc_id} contact={con_id} opp={opp_id}", file=sys.stderr)
+        return result
+
+    except Exception as e:
+        err = str(e)
+        print(f"[Lead ERROR] convert_lead: {err}", file=sys.stderr)
+        return {
+            "success": False,
+            "error": err,
+            "account_id": None,
+            "contact_id": None,
+            "opportunity_id": None,
+        }
 
 
