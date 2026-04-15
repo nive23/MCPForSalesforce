@@ -86,7 +86,7 @@ def _normalize_mcp_tool_name(name: str) -> str:
     raw = str(name).strip() if name else ""
     if not raw:
         return raw
-    compact = "_".join(raw.split())
+    compact = "_".join(raw.split()).replace("-", "_")
     if compact.upper().startswith("SALESFORCE_"):
         return compact.upper()
     return compact
@@ -101,7 +101,17 @@ def handle_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any
     contact_tools = ["SALESFORCE_CREATE_CONTACT", "SALESFORCE_ADD_CONTACT_TO_CAMPAIGN", "SALESFORCE_DELETE_CONTACT", "SALESFORCE_GET_CONTACT", "SALESFORCE_LIST_CONTACTS", "SALESFORCE_SEARCH_CONTACTS", "SALESFORCE_UPDATE_CONTACT"]
     if tool_name in contact_tools:
         return handle_contact_tool_call(tool_name, arguments)
-    lead_tools = ["SALESFORCE_CREATE_LEAD", "SALESFORCE_ADD_LEAD_TO_CAMPAIGN", "SALESFORCE_DELETE_LEAD", "SALESFORCE_GET_LEAD", "SALESFORCE_LIST_LEADS", "SALESFORCE_SEARCH_LEADS", "SALESFORCE_UPDATE_LEAD", "SALESFORCE_CONVERT_LEAD"]
+    lead_tools = [
+        "SALESFORCE_CREATE_LEAD",
+        "SALESFORCE_ADD_LEAD_TO_CAMPAIGN",
+        "SALESFORCE_DELETE_LEAD",
+        "SALESFORCE_GET_LEAD",
+        "SALESFORCE_GET_LEADS",
+        "SALESFORCE_LIST_LEADS",
+        "SALESFORCE_SEARCH_LEADS",
+        "SALESFORCE_UPDATE_LEAD",
+        "SALESFORCE_CONVERT_LEAD",
+    ]
     if tool_name in lead_tools:
         return handle_lead_tool_call(tool_name, arguments)
     campaign_tools = ["SALESFORCE_CREATE_CAMPAIGN", "SALESFORCE_DELETE_CAMPAIGN", "SALESFORCE_GET_CAMPAIGN", "SALESFORCE_LIST_CAMPAIGNS", "SALESFORCE_SEARCH_CAMPAIGNS", "SALESFORCE_UPDATE_CAMPAIGN", "SALESFORCE_REMOVE_FROM_CAMPAIGN"]
@@ -414,6 +424,13 @@ async def mcp_request(request: Request):
         elif method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments) if arguments.strip() else {}
+                except Exception:
+                    arguments = {}
+            if arguments is None or not isinstance(arguments, dict):
+                arguments = {}
             
             if not tool_name:
                 raise ValueError("Tool name is required")
@@ -421,8 +438,8 @@ async def mcp_request(request: Request):
             # Call the appropriate tool handler
             result = handle_tool_call(tool_name, arguments)
             # Always return JSON in result.content, including {"success": false, "error": "..."}.
-            # Raising on tool failures hid real Salesforce errors behind generic JSON-RPC errors.
-            response_text = json.dumps(result, indent=2)
+            # default=str avoids TypeError on datetimes/Decimals from Salesforce payloads.
+            response_text = json.dumps(result, indent=2, default=str)
             
             return {
                 "jsonrpc": "2.0",
