@@ -14,15 +14,20 @@ from simple_salesforce.exceptions import (
     SalesforceResourceNotFound,
 )
 
+import salesforce_config as _sf_cfg
 from salesforce_config import get_salesforce
 
-try:
-    from salesforce_config import invalidate_salesforce_session
-except ImportError:
-    import salesforce_config as _sf_cfg
 
-    def invalidate_salesforce_session() -> None:
-        """Clear cached JWT client when salesforce_config is older than invalidate_* export."""
+def invalidate_salesforce_session() -> None:
+    """
+    Clear cached JWT Salesforce client so the next get_salesforce() re-authenticates.
+    Uses salesforce_config.invalidate_salesforce_session when present; otherwise clears
+    module globals (works with older deployed salesforce_config.py that lacks the helper).
+    """
+    fn = getattr(_sf_cfg, "invalidate_salesforce_session", None)
+    if callable(fn):
+        fn()
+    else:
         setattr(_sf_cfg, "_sf_client", None)
         setattr(_sf_cfg, "_auth_time", None)
 
