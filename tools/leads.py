@@ -150,8 +150,32 @@ def get_lead_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "SALESFORCE_GET_LEAD",
-            "description": "Retrieves a specific lead by ID from Salesforce, returning all available fields.",
-            "inputSchema": {"type": "object", "properties": {"lead_id": {"type": "string"}}, "required": ["lead_id"]}
+            "description": (
+                "Retrieves one Lead by Id via SOQL (standard fields). "
+                "Accepts lead_id, leadId, or id. Alias tool name: SALESFORCE_GET_LEADS."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lead_id": {"type": "string", "description": "15 or 18 character Lead Id"},
+                    "leadId": {"type": "string", "description": "Same as lead_id (alternate key)"},
+                    "id": {"type": "string", "description": "Same as lead_id (alternate key)"},
+                },
+                "description": "Provide lead_id, leadId, or id (at least one).",
+            },
+        },
+        {
+            "name": "SALESFORCE_GET_LEADS",
+            "description": "Alias of SALESFORCE_GET_LEAD — fetches one Lead by Id (not a list).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lead_id": {"type": "string"},
+                    "leadId": {"type": "string"},
+                    "id": {"type": "string"},
+                },
+                "description": "Provide lead_id, leadId, or id (at least one).",
+            },
         },
         {
             "name": "SALESFORCE_LIST_LEADS",
@@ -198,32 +222,75 @@ def get_lead_tools() -> List[Dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "lead_id": {"type": "string", "description": "Lead Id (required); all other convert flags are fixed in code."},
+                    "lead_id": {"type": "string", "description": "15 or 18 character Lead Id"},
+                    "leadId": {"type": "string", "description": "Same as lead_id"},
+                    "id": {"type": "string", "description": "Same as lead_id"},
                 },
-                "required": ["lead_id"],
+                "description": "Provide lead_id, leadId, or id. All other convert flags are fixed in code.",
             },
         },
     ]
 
+def _normalize_lead_id_in_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy args and set lead_id from common alternate keys (MCP / LLM naming)."""
+    out = dict(arguments or {})
+    if out.get("lead_id") and str(out["lead_id"]).strip():
+        out["lead_id"] = str(out["lead_id"]).strip()
+        return out
+    for alt in (
+        "leadId",
+        "Lead_Id",
+        "LeadId",
+        "salesforce_lead_id",
+        "record_id",
+        "RecordId",
+        "id",
+        "Id",
+        "ID",
+    ):
+        v = out.get(alt)
+        if v is not None and str(v).strip():
+            out["lead_id"] = str(v).strip()
+            break
+    return out
+
+
+def _query_lead_row_by_id(sf: Any, lead_id: str) -> Optional[Dict[str, Any]]:
+    """Single Lead row by Id (standard fields only). Shared by get_lead and convert."""
+    esc = _lead_escape(str(lead_id).strip())
+    q = (
+        "SELECT Id, Name, FirstName, LastName, Company, Email, Phone, MobilePhone, "
+        "Street, City, State, PostalCode, Country, Status, LeadSource, Rating, "
+        "Title, Industry, AnnualRevenue, NumberOfEmployees, Website, Description, "
+        "IsConverted, ConvertedAccountId, ConvertedContactId, ConvertedOpportunityId, "
+        "OwnerId, CreatedDate, LastModifiedDate "
+        f"FROM Lead WHERE Id = '{esc}' LIMIT 1"
+    )
+    result = sf.query(q)
+    recs = result.get("records") or []
+    return recs[0] if recs else None
+
+
 def handle_lead_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle lead-related tool calls"""
+    args = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
     sf = get_salesforce()
     if tool_name == "SALESFORCE_CREATE_LEAD":
-        return create_lead(sf, arguments)
+        return create_lead(sf, args)
     if tool_name == "SALESFORCE_ADD_LEAD_TO_CAMPAIGN":
-        return add_lead_to_campaign(sf, arguments)
+        return add_lead_to_campaign(sf, args)
     if tool_name == "SALESFORCE_DELETE_LEAD":
-        return delete_lead(sf, arguments)
-    if tool_name == "SALESFORCE_GET_LEAD":
-        return get_lead(sf, arguments)
+        return delete_lead(sf, args)
+    if tool_name in ("SALESFORCE_GET_LEAD", "SALESFORCE_GET_LEADS"):
+        return get_lead(sf, args)
     if tool_name == "SALESFORCE_LIST_LEADS":
-        return list_leads(sf, arguments)
+        return list_leads(sf, args)
     if tool_name == "SALESFORCE_SEARCH_LEADS":
-        return search_leads(sf, arguments)
+        return search_leads(sf, args)
     if tool_name == "SALESFORCE_UPDATE_LEAD":
-        return update_lead(sf, arguments)
+        return update_lead(sf, args)
     if tool_name == "SALESFORCE_CONVERT_LEAD":
-        return convert_lead(sf, arguments)
+        return convert_lead(sf, args)
     raise ValueError(f"Unknown lead tool: {tool_name}")
 
 def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -307,6 +374,7 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
 def add_lead_to_campaign(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Add a lead to a campaign (fails if already a member). Both campaign_id and lead_id must be valid Salesforce IDs."""
     try:
+        arguments = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
         lead_id = arguments.get("lead_id")
         campaign_id = arguments.get("campaign_id")
         if not lead_id:
@@ -355,6 +423,7 @@ def add_lead_to_campaign(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def delete_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        arguments = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
         lead_id = arguments.get("lead_id")
         if not lead_id:
             raise ValueError("lead_id is required")
@@ -367,12 +436,21 @@ def delete_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fetch one Lead by Id using SOQL (bounded standard fields).
+    Avoids SObject GET returning huge/unserializable payloads and matches typical FLS.
+    """
     try:
-        lead_id = arguments.get("lead_id")
+        args = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
+        lead_id = args.get("lead_id")
         if not lead_id:
-            raise ValueError("lead_id is required")
-        lead_sf = SFType("Lead", sf.session_id, sf.sf_instance)
-        rec = lead_sf.get(lead_id)
+            return {
+                "success": False,
+                "error": "Provide lead_id, leadId, or id for the Lead to fetch.",
+            }
+        rec = _query_lead_row_by_id(sf, str(lead_id))
+        if not rec:
+            return {"success": False, "error": f"No Lead found with Id {lead_id}"}
         return {"success": True, "record": rec}
     except Exception as e:
         print(f"[Lead ERROR] {e}", file=sys.stderr)
@@ -430,6 +508,7 @@ LEAD_UPDATE_MAP = {
 
 def update_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        arguments = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
         lead_id = arguments.get("lead_id")
         if not lead_id:
             raise ValueError("lead_id is required")
@@ -666,8 +745,9 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
     Single attempt: REST LeadConvert or SOAP fallback, then post-convert steps.
     Raises on failure so caller can retry after session refresh.
     """
-    lead_sf = SFType("Lead", sf.session_id, sf.sf_instance)
-    lead_row = lead_sf.get(lead_id)
+    lead_row = _query_lead_row_by_id(sf, lead_id)
+    if not lead_row:
+        raise RuntimeError(f"No Lead found with Id {lead_id}")
     first = (lead_row.get("FirstName") or "").strip()
     last = (lead_row.get("LastName") or "").strip()
     lead_name = (lead_row.get("Name") or f"{first} {last}".strip() or "Lead").strip()
@@ -734,17 +814,18 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     then standard price book, platform event, and Lead_Product__c line items.
     Retries once after a fresh JWT login if the session is invalid (SOAP/REST).
     """
-    lead_id = arguments.get("lead_id")
+    args = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
+    lead_id = args.get("lead_id")
     if not lead_id:
         return {
             "success": False,
-            "error": "Lead Id cannot be null",
+            "error": "Provide lead_id, leadId, or id for the Lead to convert.",
             "account_id": None,
             "contact_id": None,
             "opportunity_id": None,
         }
 
-    lid = str(lead_id)
+    lid = str(lead_id).strip()
     for attempt in range(2):
         try:
             if attempt > 0:
