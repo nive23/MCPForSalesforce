@@ -564,31 +564,31 @@ def _soap_session_id_cdata(session_id: str) -> str:
     return sid
 
 
-def _convert_lead_soap(
-    sf: Any,
+def _build_partner_convert_soap_envelope(
+    *,
+    include_session_header: bool,
+    session_id: str,
     lead_id: str,
     converted_status: str,
     opportunity_name: str,
-) -> Tuple[str, str, str]:
-    """
-    Partner SOAP API convertLead — used when REST quick action returns 404.
-    Uses a one-off HTTP POST (not sf.session) so no REST Authorization header is sent with SOAP,
-    which can cause INVALID_SESSION_ID / Illegal Session on some orgs.
-    """
-    sid_cdata = _soap_session_id_cdata(sf.session_id)
+) -> str:
     lid = escape(str(lead_id), entities={"'": "&apos;", '"': "&quot;"})
     cst = escape(str(converted_status), entities={"'": "&apos;", '"': "&quot;"})
     onm = escape(str(opportunity_name), entities={"'": "&apos;", '"': "&quot;"})
-    ver = sf.sf_version
-    host = sf.sf_instance
-    url = f"https://{host}/services/Soap/u/{ver}"
-    envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+    if include_session_header:
+        sid_cdata = _soap_session_id_cdata(session_id)
+        header_xml = (
+            "  <soapenv:Header>\n"
+            "    <urn:SessionHeader>\n"
+            f"      <urn:sessionId><![CDATA[{sid_cdata}]]></urn:sessionId>\n"
+            "    </urn:SessionHeader>\n"
+            "  </soapenv:Header>"
+        )
+    else:
+        header_xml = "  <soapenv:Header/>"
+    return f"""<?xml version="1.0" encoding="utf-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:partner.soap.sforce.com">
-  <soapenv:Header>
-    <urn:SessionHeader>
-      <urn:sessionId><![CDATA[{sid_cdata}]]></urn:sessionId>
-    </urn:SessionHeader>
-  </soapenv:Header>
+{header_xml}
   <soapenv:Body>
     <urn:convertLead>
       <urn:leadConverts>
@@ -602,11 +602,9 @@ def _convert_lead_soap(
     </urn:convertLead>
   </soapenv:Body>
 </soapenv:Envelope>"""
-    headers = {
-        "Content-Type": "text/xml; charset=UTF-8",
-        "SOAPAction": '""',
-    }
-    resp = requests.post(url, data=envelope.encode("utf-8"), headers=headers, timeout=120)
+
+
+def _parse_soap_convert_lead_response(resp: requests.Response) -> Tuple[str, str, str]:
     if resp.status_code >= 300:
         raise RuntimeError(f"SOAP convertLead HTTP {resp.status_code}: {resp.text[:2500]}")
 
@@ -650,6 +648,65 @@ def _convert_lead_soap(
             "SOAP convertLead did not return opportunityId; org may block opportunity on convert."
         )
     return acc_id, con_id, opp_id
+
+
+def _convert_lead_soap(
+    sf: Any,
+    lead_id: str,
+    converted_status: str,
+    opportunity_name: str,
+) -> Tuple[str, str, str]:
+    """
+    Partner SOAP convertLead when REST quick action is unavailable.
+    Tries OAuth Bearer on the HTTP request first (no SessionHeader), then SessionHeader-only;
+    some orgs reject access tokens in SOAP SessionHeader ("Illegal Session") but accept Bearer.
+    """
+    ver = sf.sf_version
+    host = sf.sf_instance
+    url = f"https://{host}/services/Soap/u/{ver}"
+    token = str(sf.session_id)
+    base_headers = {
+        "Content-Type": "text/xml; charset=UTF-8",
+        "SOAPAction": '""',
+    }
+    errors: List[str] = []
+
+    # 1) Bearer in Authorization header, empty SOAP header (documented OAuth + SOAP pattern)
+    try:
+        env1 = _build_partner_convert_soap_envelope(
+            include_session_header=False,
+            session_id=token,
+            lead_id=lead_id,
+            converted_status=converted_status,
+            opportunity_name=opportunity_name,
+        )
+        h1 = dict(base_headers)
+        h1["Authorization"] = f"Bearer {token}"
+        r1 = requests.post(url, data=env1.encode("utf-8"), headers=h1, timeout=120)
+        return _parse_soap_convert_lead_response(r1)
+    except Exception as ex1:
+        errors.append(f"bearer_header: {ex1}")
+
+    # 2) SessionHeader only (no Authorization header)
+    try:
+        env2 = _build_partner_convert_soap_envelope(
+            include_session_header=True,
+            session_id=token,
+            lead_id=lead_id,
+            converted_status=converted_status,
+            opportunity_name=opportunity_name,
+        )
+        r2 = requests.post(url, data=env2.encode("utf-8"), headers=base_headers, timeout=120)
+        return _parse_soap_convert_lead_response(r2)
+    except Exception as ex2:
+        errors.append(f"session_header: {ex2}")
+
+    raise RuntimeError(
+        "SOAP convertLead failed with all auth modes. "
+        + " | ".join(errors)
+        + " — If this persists, use REST LeadConvert in the org or an Apex REST convert endpoint; "
+        "JWT access tokens are not always accepted by Partner SOAP in every org."
+    )
 
 
 def _salesforce_session_should_retry(exc: BaseException) -> bool:
