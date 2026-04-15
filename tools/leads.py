@@ -7,6 +7,8 @@ import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Optional, Tuple
 from xml.sax.saxutils import escape
 
+import requests
+
 from simple_salesforce import SFType
 from simple_salesforce.exceptions import (
     SalesforceError,
@@ -554,6 +556,14 @@ def _soap_local_tag(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
+def _soap_session_id_cdata(session_id: str) -> str:
+    """Embed OAuth access token in CDATA so XML special characters cannot break the envelope."""
+    sid = str(session_id)
+    if "]]>" in sid:
+        sid = sid.replace("]]>", "]]]]><![CDATA[>")
+    return sid
+
+
 def _convert_lead_soap(
     sf: Any,
     lead_id: str,
@@ -561,9 +571,11 @@ def _convert_lead_soap(
     opportunity_name: str,
 ) -> Tuple[str, str, str]:
     """
-    Partner SOAP API convertLead — works when REST .../actions/quick/LeadConvert is not available (404).
+    Partner SOAP API convertLead — used when REST quick action returns 404.
+    Uses a one-off HTTP POST (not sf.session) so no REST Authorization header is sent with SOAP,
+    which can cause INVALID_SESSION_ID / Illegal Session on some orgs.
     """
-    sid = escape(str(sf.session_id), entities={"'": "&apos;", '"': "&quot;"})
+    sid_cdata = _soap_session_id_cdata(sf.session_id)
     lid = escape(str(lead_id), entities={"'": "&apos;", '"': "&quot;"})
     cst = escape(str(converted_status), entities={"'": "&apos;", '"': "&quot;"})
     onm = escape(str(opportunity_name), entities={"'": "&apos;", '"': "&quot;"})
@@ -574,7 +586,7 @@ def _convert_lead_soap(
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:partner.soap.sforce.com">
   <soapenv:Header>
     <urn:SessionHeader>
-      <urn:sessionId>{sid}</urn:sessionId>
+      <urn:sessionId><![CDATA[{sid_cdata}]]></urn:sessionId>
     </urn:SessionHeader>
   </soapenv:Header>
   <soapenv:Body>
@@ -594,7 +606,7 @@ def _convert_lead_soap(
         "Content-Type": "text/xml; charset=UTF-8",
         "SOAPAction": '""',
     }
-    resp = sf.session.post(url, data=envelope.encode("utf-8"), headers=headers, timeout=120)
+    resp = requests.post(url, data=envelope.encode("utf-8"), headers=headers, timeout=120)
     if resp.status_code >= 300:
         raise RuntimeError(f"SOAP convertLead HTTP {resp.status_code}: {resp.text[:2500]}")
 
@@ -641,15 +653,21 @@ def _convert_lead_soap(
 
 
 def _salesforce_session_should_retry(exc: BaseException) -> bool:
-    """True when a fresh JWT login may fix the failure (SOAP fault or REST 401)."""
+    """True when a fresh JWT login may fix the failure (REST 401 / expired session)."""
     if isinstance(exc, SalesforceExpiredSession):
         return True
     if isinstance(exc, SalesforceError) and getattr(exc, "status", None) == 401:
         return True
     msg = str(exc).upper()
-    if "INVALID_SESSION_ID" in msg:
-        return True
+    # SOAP Partner often returns INVALID_SESSION_ID + Illegal Session for OAuth token issues;
+    # re-fetching JWT does not fix that — do not burn a retry loop.
+    if "ILLEGAL SESSION" in msg:
+        return False
+    if "INVALID_SESSION_ID" in msg and "SOAP" in msg:
+        return False
     if "SESSION_EXPIRED" in msg or "INSUFFICIENT_SESSION" in msg:
+        return True
+    if "INVALID_SESSION_ID" in msg:
         return True
     return False
 
