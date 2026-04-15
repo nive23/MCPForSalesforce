@@ -14,7 +14,17 @@ from simple_salesforce.exceptions import (
     SalesforceResourceNotFound,
 )
 
-from salesforce_config import get_salesforce, invalidate_salesforce_session
+from salesforce_config import get_salesforce
+
+try:
+    from salesforce_config import invalidate_salesforce_session
+except ImportError:
+    import salesforce_config as _sf_cfg
+
+    def invalidate_salesforce_session() -> None:
+        """Clear cached JWT client when salesforce_config is older than invalidate_* export."""
+        setattr(_sf_cfg, "_sf_client", None)
+        setattr(_sf_cfg, "_auth_time", None)
 
 # Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
 LEAD_PRODUCT_OBJECT = "Lead_Product__c"
