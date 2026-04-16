@@ -7,7 +7,8 @@ import sys
 import os
 import json
 import asyncio
-from typing import Dict, Any
+from typing import Any, Dict, Optional
+
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +51,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Session-Id"],
 )
 
 # Request logging middleware
@@ -59,6 +61,70 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     print(f"[RESPONSE] {request.method} {request.url.path} -> {response.status_code}", file=sys.stderr)
     return response
+
+
+def _extract_ui_session_id(request: Request, body: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """
+    UI correlation session: header, query string, or JSON (top-level / meta / params / tool arguments).
+    If present on the request, echo the same value back on responses (see _merge_ui_session).
+    """
+    for h in (
+        "x-session-id",
+        "x-sessionid",
+        "session-id",
+        "x-ui-session-id",
+        "x-correlation-session",
+    ):
+        v = request.headers.get(h)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    for qk in ("sessionId", "session_id", "uiSessionId"):
+        v = request.query_params.get(qk)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    if body and isinstance(body, dict):
+        for k in ("sessionId", "session_id", "uiSessionId"):
+            v = body.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        meta = body.get("meta")
+        if isinstance(meta, dict):
+            for k in ("sessionId", "session_id", "uiSessionId"):
+                v = meta.get(k)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+        params = body.get("params")
+        if isinstance(params, dict):
+            for k in ("sessionId", "session_id", "uiSessionId"):
+                v = params.get(k)
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            args = params.get("arguments")
+            if isinstance(args, dict):
+                for k in ("sessionId", "session_id", "uiSessionId"):
+                    v = args.get(k)
+                    if v is not None and str(v).strip():
+                        return str(v).strip()
+    return None
+
+
+def _merge_ui_session(payload: Dict[str, Any], session_id: Optional[str]) -> Dict[str, Any]:
+    """Attach sessionId to a JSON object when the client sent one (same key for UI)."""
+    if session_id is not None and str(session_id).strip():
+        payload = dict(payload)
+        payload["sessionId"] = str(session_id).strip()
+    return payload
+
+
+@app.middleware("http")
+async def ui_session_echo_header(request: Request, call_next):
+    """Echo X-Session-Id on the HTTP response when the handler set request.state.ui_session_id."""
+    response = await call_next(request)
+    sid = getattr(request.state, "ui_session_id", None)
+    if sid:
+        response.headers["X-Session-Id"] = str(sid)
+    return response
+
 
 # -------------------------------------------------
 # Helper Functions
@@ -143,18 +209,23 @@ def handle_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any
 # -------------------------------------------------
 
 @app.get("/")
-async def root():
+async def root(request: Request):
     """Root endpoint - Health check and transport info"""
-    return {
-        "status": "ok",
-        "server": "salesforce-azure",
-        "version": "1.0.0",
-        "protocol": "MCP",
-        "transport": "SSE",
-        "sse_endpoint": "/sse",
-        "message_endpoint": "POST /",
-        "boomi_compatible": True
-    }
+    sid = _extract_ui_session_id(request, None)
+    request.state.ui_session_id = sid
+    return _merge_ui_session(
+        {
+            "status": "ok",
+            "server": "salesforce-azure",
+            "version": "1.0.0",
+            "protocol": "MCP",
+            "transport": "SSE",
+            "sse_endpoint": "/sse",
+            "message_endpoint": "POST /",
+            "boomi_compatible": True,
+        },
+        sid,
+    )
 
 @app.get("/sse")
 async def sse_endpoint(request: Request):
@@ -163,26 +234,34 @@ async def sse_endpoint(request: Request):
     This is the primary transport endpoint for Boomi integration
     """
     print("[MCP] SSE connection established", file=sys.stderr)
-    
+    sid = _extract_ui_session_id(request, None)
+    request.state.ui_session_id = sid
+
     async def event_stream():
         # Send initial connection message in MCP format
-        init_message = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {}
-        }
+        init_message = _merge_ui_session(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            },
+            sid,
+        )
         yield f"data: {json.dumps(init_message)}\n\n"
-        
+
         # Keep connection alive with periodic pings
         while True:
             await asyncio.sleep(30)
-            ping_message = {
-                "jsonrpc": "2.0",
-                "method": "ping",
-                "params": {}
-            }
+            ping_message = _merge_ui_session(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "ping",
+                    "params": {},
+                },
+                sid,
+            )
             yield f"data: {json.dumps(ping_message)}\n\n"
-    
+
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
@@ -191,19 +270,30 @@ async def sse_endpoint(request: Request):
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*"
-        }
+            "Access-Control-Allow-Headers": "*",
+        },
     )
 
 @app.post("/register")
-async def register():
+async def register(request: Request):
     """MCP server registration endpoint"""
     print("[MCP] Register endpoint called", file=sys.stderr)
-    return {
-        "status": "registered",
-        "server": "salesforce-azure",
-        "version": "1.0.0"
-    }
+    sid = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            sid = _extract_ui_session_id(request, body)
+    except Exception:
+        sid = _extract_ui_session_id(request, None)
+    request.state.ui_session_id = sid
+    return _merge_ui_session(
+        {
+            "status": "registered",
+            "server": "salesforce-azure",
+            "version": "1.0.0",
+        },
+        sid,
+    )
 
 # -------------------------------------------------
 # Boomi REST API Endpoints (REST wrapper for MCP tools)
@@ -225,11 +315,14 @@ async def boomi_generate_quote(request: Request):
             else:
                 # GET request - get params from query string
                 body = dict(request.query_params)
-        except:
+        except Exception:
             # Try form data
             form = await request.form()
             body = dict(form)
-        
+
+        sid = _extract_ui_session_id(request, body if isinstance(body, dict) else None)
+        request.state.ui_session_id = sid
+
         # Extract opportunity_id from various possible formats
         opportunity_id = (
             body.get("opportunity_id") or 
@@ -242,10 +335,13 @@ async def boomi_generate_quote(request: Request):
         if not opportunity_id:
             return JSONResponse(
                 status_code=400,
-                content={
-                    "error": "Missing required parameter: opportunity_id",
-                    "message": "Please provide opportunity_id in the request"
-                }
+                content=_merge_ui_session(
+                    {
+                        "error": "Missing required parameter: opportunity_id",
+                        "message": "Please provide opportunity_id in the request",
+                    },
+                    sid,
+                ),
             )
         
         print(f"[Boomi] Creating quote for opportunity: {opportunity_id}", file=sys.stderr)
@@ -257,29 +353,40 @@ async def boomi_generate_quote(request: Request):
         if result.get("errorMessage"):
             return JSONResponse(
                 status_code=500,
-                content={
-                    "error": result["errorMessage"],
-                    "success": False
-                }
+                content=_merge_ui_session(
+                    {
+                        "error": result["errorMessage"],
+                        "success": False,
+                    },
+                    sid,
+                ),
             )
-        
+
         return JSONResponse(
             status_code=200,
-            content={
-                "success": True,
-                "data": result
-            }
+            content=_merge_ui_session(
+                {
+                    "success": True,
+                    "data": result,
+                },
+                sid,
+            ),
         )
-    
+
     except Exception as e:
         error_msg = str(e)
         print(f"[Boomi ERROR] {error_msg}", file=sys.stderr)
+        sid = _extract_ui_session_id(request, None)
+        request.state.ui_session_id = sid
         return JSONResponse(
             status_code=500,
-            content={
-                "error": error_msg,
-                "success": False
-            }
+            content=_merge_ui_session(
+                {
+                    "error": error_msg,
+                    "success": False,
+                },
+                sid,
+            ),
         )
 
 @app.get("/ws/rest/Get_Accounts/V1")
@@ -297,9 +404,12 @@ async def boomi_get_accounts(request: Request):
                 body = await request.json()
             else:
                 body = dict(request.query_params)
-        except:
+        except Exception:
             body = {}
-        
+
+        sid = _extract_ui_session_id(request, body if isinstance(body, dict) else None)
+        request.state.ui_session_id = sid
+
         limit = int(body.get("limit", body.get("Limit", 5)))
         if limit < 1 or limit > 100:
             limit = 5
@@ -310,117 +420,171 @@ async def boomi_get_accounts(request: Request):
         if not result.get("success"):
             return JSONResponse(
                 status_code=500,
-                content={
-                    "error": result.get("error", "Unknown error"),
-                    "success": False
-                }
+                content=_merge_ui_session(
+                    {
+                        "error": result.get("error", "Unknown error"),
+                        "success": False,
+                    },
+                    sid,
+                ),
             )
-        
+
         return JSONResponse(
             status_code=200,
-            content={
-                "success": True,
-                "data": result.get("accounts", []),
-                "count": result.get("count", 0)
-            }
+            content=_merge_ui_session(
+                {
+                    "success": True,
+                    "data": result.get("accounts", []),
+                    "count": result.get("count", 0),
+                },
+                sid,
+            ),
         )
-    
+
     except Exception as e:
         error_msg = str(e)
         print(f"[Boomi ERROR] {error_msg}", file=sys.stderr)
+        sid = _extract_ui_session_id(request, None)
+        request.state.ui_session_id = sid
         return JSONResponse(
             status_code=500,
-            content={
-                "error": error_msg,
-                "success": False
-            }
+            content=_merge_ui_session(
+                {
+                    "error": error_msg,
+                    "success": False,
+                },
+                sid,
+            ),
         )
 
 @app.get("/.well-known/oauth-protected-resource")
-async def oauth_protected_resource():
+async def oauth_protected_resource(request: Request):
     """OAuth protected resource discovery"""
     print("[MCP] OAuth protected resource endpoint called", file=sys.stderr)
-    return {
-        "resource": "salesforce-azure",
-        "scopes_supported": []
-    }
+    sid = _extract_ui_session_id(request, None)
+    request.state.ui_session_id = sid
+    return _merge_ui_session(
+        {
+            "resource": "salesforce-azure",
+            "scopes_supported": [],
+        },
+        sid,
+    )
 
 @app.get("/.well-known/oauth-authorization-server")
-async def oauth_authorization_server():
+async def oauth_authorization_server(request: Request):
     """OAuth authorization server discovery"""
     print("[MCP] OAuth authorization server endpoint called", file=sys.stderr)
-    return {
-        "issuer": "salesforce-azure",
-        "authorization_endpoint": None,
-        "token_endpoint": None
-    }
+    sid = _extract_ui_session_id(request, None)
+    request.state.ui_session_id = sid
+    return _merge_ui_session(
+        {
+            "issuer": "salesforce-azure",
+            "authorization_endpoint": None,
+            "token_endpoint": None,
+        },
+        sid,
+    )
 
 @app.post("/")
 @app.post("")
 async def mcp_request(request: Request):
     """Handle MCP protocol requests"""
     print(f"[MCP] POST / received", file=sys.stderr)
+    body: Optional[Dict[str, Any]] = None
     try:
         # Try to get JSON body
         try:
             body = await request.json()
         except Exception as json_error:
             print(f"[MCP ERROR] Failed to parse JSON: {json_error}", file=sys.stderr)
+            sid = _extract_ui_session_id(request, None)
+            request.state.ui_session_id = sid
             return JSONResponse(
                 status_code=400,
-                content={
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32700,
-                        "message": "Parse error"
-                    }
-                }
+                content=_merge_ui_session(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32700,
+                            "message": "Parse error",
+                        },
+                    },
+                    sid,
+                ),
             )
-        
+
+        if not isinstance(body, dict):
+            sid = _extract_ui_session_id(request, None)
+            request.state.ui_session_id = sid
+            return JSONResponse(
+                status_code=400,
+                content=_merge_ui_session(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Expected a JSON object body"},
+                    },
+                    sid,
+                ),
+            )
+
+        sid = _extract_ui_session_id(request, body)
+        request.state.ui_session_id = sid
+
         method = body.get("method")
         params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
         request_id = body.get("id")
-        
+
         print(f"[MCP] Received request: {method} (id: {request_id})", file=sys.stderr)
-        
+
         if method == "initialize":
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
+            return _merge_ui_session(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "tools": {},
+                        },
+                        "serverInfo": {
+                            "name": "salesforce-azure",
+                            "version": "1.0.0",
+                        },
                     },
-                    "serverInfo": {
-                        "name": "salesforce-azure",
-                        "version": "1.0.0"
-                    }
-                }
-            }
-        
+                },
+                sid,
+            )
+
         elif method == "tools/list":
             # Get all tools from all modules
             all_tools = get_all_tools()
-            
+
             # Convert to MCP format
             mcp_tools = []
             for tool in all_tools:
                 mcp_tool = {
                     "name": tool["name"],
                     "description": tool["description"],
-                    "inputSchema": tool["inputSchema"]
+                    "inputSchema": tool["inputSchema"],
                 }
                 mcp_tools.append(mcp_tool)
-            
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "tools": mcp_tools
-                }
-            }
-        
+
+            return _merge_ui_session(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "tools": mcp_tools,
+                    },
+                },
+                sid,
+            )
+
         elif method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
@@ -431,57 +595,76 @@ async def mcp_request(request: Request):
                     arguments = {}
             if arguments is None or not isinstance(arguments, dict):
                 arguments = {}
-            
+
             if not tool_name:
                 raise ValueError("Tool name is required")
-            
+
             # Call the appropriate tool handler
             result = handle_tool_call(tool_name, arguments)
             # Always return JSON in result.content, including {"success": false, "error": "..."}.
             # default=str avoids TypeError on datetimes/Decimals from Salesforce payloads.
-            response_text = json.dumps(result, indent=2, default=str)
-            
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": response_text
-                        }
-                    ]
-                }
+            result_for_ui: Dict[str, Any] = dict(result) if isinstance(result, dict) else {"value": result}
+            if sid:
+                result_for_ui["sessionId"] = str(sid)
+            response_text = json.dumps(result_for_ui, indent=2, default=str)
+
+            result_obj: Dict[str, Any] = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": response_text,
+                    }
+                ],
             }
-        
+            if sid:
+                result_obj["sessionId"] = str(sid)
+
+            return _merge_ui_session(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": result_obj,
+                },
+                sid,
+            )
+
         else:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Method not found: {method}"
-                }
-            }
-    
+            return _merge_ui_session(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: {method}",
+                    },
+                },
+                sid,
+            )
+
     except Exception as e:
         error_msg = str(e)
         import traceback
+
         print(f"[MCP ERROR] {error_msg}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         request_id = None
-        if 'body' in locals():
+        if isinstance(body, dict):
             request_id = body.get("id")
+        sid = _extract_ui_session_id(request, body if isinstance(body, dict) else None)
+        request.state.ui_session_id = sid
         return JSONResponse(
             status_code=200,
-            content={
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32603,
-                    "message": error_msg
-                }
-            }
+            content=_merge_ui_session(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32603,
+                        "message": error_msg,
+                    },
+                },
+                sid,
+            ),
         )
 
 # -------------------------------------------------
