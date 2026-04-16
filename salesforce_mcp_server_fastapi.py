@@ -133,6 +133,8 @@ async def ui_session_echo_header(request: Request, call_next):
 def get_all_tools() -> list:
     """Get all available MCP tools from all modules"""
     tools = []
+    # Quote tools first so MCP clients that truncate the tool list still expose accept/reject.
+    tools.extend(get_quote_tools())
     tools.extend(get_account_tools())
     tools.extend(get_contact_tools())
     tools.extend(get_lead_tools())
@@ -140,7 +142,6 @@ def get_all_tools() -> list:
     tools.extend(get_opportunity_tools())
     tools.extend(get_task_tools())
     tools.extend(get_note_tools())
-    tools.extend(get_quote_tools())
     tools.extend(get_soql_tools())
     tools.extend(get_report_tools())
     tools.extend(get_user_tools())
@@ -192,7 +193,14 @@ def handle_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any
     note_tools = ["SALESFORCE_CREATE_NOTE", "SALESFORCE_LIST_NOTES", "SALESFORCE_SEARCH_NOTES", "SALESFORCE_UPDATE_NOTE"]
     if tool_name in note_tools:
         return handle_note_tool_call(tool_name, arguments)
-    if tool_name == "create_quote_from_opportunity":
+    quote_tools = [
+        "create_quote_from_opportunity",
+        "SALESFORCE_CREATE_QUOTE_FROM_OPPORTUNITY",
+        "SALESFORCE_SET_QUOTE_STATUS",
+        "SALESFORCE_ACCEPT_QUOTE",
+        "SALESFORCE_REJECT_QUOTE",
+    ]
+    if tool_name in quote_tools:
         return handle_quote_tool_call(tool_name, arguments)
     if tool_name == "SALESFORCE_RUN_SOQL_QUERY":
         return handle_soql_tool_call(tool_name, arguments)
