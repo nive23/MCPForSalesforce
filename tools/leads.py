@@ -2,9 +2,11 @@
 Lead Operations
 Handles Salesforce Lead creation, campaign membership, and lead conversion
 """
+import os
 import sys
 import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import urlparse
 from xml.sax.saxutils import escape
 
 import requests
@@ -234,7 +236,9 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                 "no owner notification email, converted status 'Converted', then standard price book, "
                 "Lead_Product__c line items, and Opportunity_PlatformEvent__e. "
                 "Uses REST LeadConvert quick action when available; if that returns 404, falls back to "
-                "SOAP Partner API convertLead (same as Database.convertLead)."
+                "SOAP Partner convertLead. If JWT is rejected by SOAP (Illegal Session), set env "
+                "SF_SOAP_PASSWORD to the integration user's password+security token for SOAP login(), "
+                "or enable REST LeadConvert / Apex REST in the org."
             ),
             "inputSchema": {
                 "type": "object",
@@ -564,6 +568,51 @@ def _soap_session_id_cdata(session_id: str) -> str:
     return sid
 
 
+def _soap_first_descendant_text(root: ET.Element, local_tag: str) -> Optional[str]:
+    for el in root.iter():
+        if _soap_local_tag(el.tag) == local_tag and el.text:
+            t = el.text.strip()
+            if t:
+                return t
+    return None
+
+
+def _soap_partner_password_login(login_base: str, api_version: str, username: str, password: str) -> Tuple[str, str]:
+    """
+    Partner SOAP login() with username + password (password is usually password+security_token).
+    Returns (session_id, instance_hostname) for subsequent SOAP calls on the instance host.
+    """
+    user_cdata = _soap_session_id_cdata(username)
+    pwd_cdata = _soap_session_id_cdata(password)
+    url = f"{login_base.rstrip('/')}/services/Soap/u/{api_version}"
+    envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:partner.soap.sforce.com">
+  <soapenv:Body>
+    <urn:login>
+      <urn:username><![CDATA[{user_cdata}]]></urn:username>
+      <urn:password><![CDATA[{pwd_cdata}]]></urn:password>
+    </urn:login>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    headers = {"Content-Type": "text/xml; charset=UTF-8", "SOAPAction": '""'}
+    resp = requests.post(url, data=envelope.encode("utf-8"), headers=headers, timeout=60)
+    if resp.status_code >= 300:
+        raise RuntimeError(f"SOAP login HTTP {resp.status_code}: {resp.text[:1500]}")
+    root = ET.fromstring(resp.content)
+    for el in root.iter():
+        if _soap_local_tag(el.tag) == "faultstring" and el.text:
+            raise RuntimeError(f"SOAP login fault: {el.text.strip()}")
+    sid = _soap_first_descendant_text(root, "sessionId")
+    surl = _soap_first_descendant_text(root, "serverUrl")
+    if not sid or not surl:
+        raise RuntimeError(f"SOAP login: missing sessionId or serverUrl: {resp.text[:1500]}")
+    parsed = urlparse(surl)
+    host = parsed.hostname
+    if not host:
+        raise RuntimeError(f"SOAP login: invalid serverUrl: {surl}")
+    return sid, host
+
+
 def _build_partner_convert_soap_envelope(
     *,
     include_session_header: bool,
@@ -658,8 +707,13 @@ def _convert_lead_soap(
 ) -> Tuple[str, str, str]:
     """
     Partner SOAP convertLead when REST quick action is unavailable.
-    Tries OAuth Bearer on the HTTP request first (no SessionHeader), then SessionHeader-only;
-    some orgs reject access tokens in SOAP SessionHeader ("Illegal Session") but accept Bearer.
+
+    Order:
+    1) If SF_SOAP_PASSWORD is set: SOAP login() with SF_USERNAME + that password (use
+       password+Security Token concatenated) to obtain a real SOAP session id — works when
+       JWT access tokens are rejected by Partner SOAP ("Illegal Session").
+    2) OAuth Bearer on HTTP + empty SOAP header.
+    3) OAuth access token in SessionHeader only.
     """
     ver = sf.sf_version
     host = sf.sf_instance
@@ -671,7 +725,31 @@ def _convert_lead_soap(
     }
     errors: List[str] = []
 
-    # 1) Bearer in Authorization header, empty SOAP header (documented OAuth + SOAP pattern)
+    soap_pw = os.getenv("SF_SOAP_PASSWORD")
+    if soap_pw and str(soap_pw).strip():
+        try:
+            login_base = getattr(_sf_cfg, "SF_LOGIN_URL", None) or os.getenv(
+                "SF_LOGIN_URL", "https://login.salesforce.com"
+            )
+            username = getattr(_sf_cfg, "SF_USERNAME", None) or os.getenv("SF_USERNAME")
+            if not username:
+                raise RuntimeError("SF_USERNAME is required for SF_SOAP_PASSWORD SOAP login")
+            sid, soap_host = _soap_partner_password_login(
+                str(login_base), str(ver), str(username).strip(), str(soap_pw).strip()
+            )
+            convert_url = f"https://{soap_host}/services/Soap/u/{ver}"
+            env0 = _build_partner_convert_soap_envelope(
+                include_session_header=True,
+                session_id=sid,
+                lead_id=lead_id,
+                converted_status=converted_status,
+                opportunity_name=opportunity_name,
+            )
+            r0 = requests.post(convert_url, data=env0.encode("utf-8"), headers=base_headers, timeout=120)
+            return _parse_soap_convert_lead_response(r0)
+        except Exception as ex0:
+            errors.append(f"soap_password_login: {ex0}")
+
     try:
         env1 = _build_partner_convert_soap_envelope(
             include_session_header=False,
@@ -687,7 +765,6 @@ def _convert_lead_soap(
     except Exception as ex1:
         errors.append(f"bearer_header: {ex1}")
 
-    # 2) SessionHeader only (no Authorization header)
     try:
         env2 = _build_partner_convert_soap_envelope(
             include_session_header=True,
@@ -704,8 +781,9 @@ def _convert_lead_soap(
     raise RuntimeError(
         "SOAP convertLead failed with all auth modes. "
         + " | ".join(errors)
-        + " — If this persists, use REST LeadConvert in the org or an Apex REST convert endpoint; "
-        "JWT access tokens are not always accepted by Partner SOAP in every org."
+        + " — Set SF_SOAP_PASSWORD (integration user password + security token) for SOAP login, "
+        "or enable REST LeadConvert / add Apex REST. JWT access tokens are not accepted by "
+        "Partner SOAP in this org."
     )
 
 
