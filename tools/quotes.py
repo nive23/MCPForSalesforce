@@ -20,16 +20,72 @@ def _soql_escape(s: str) -> str:
     return str(s).replace("'", "''")
 
 
+def _soql_query_all_records(sf: Any, soql: str) -> List[Dict[str, Any]]:
+    """Return every SOQL row (uses query_all so all batches beyond 2000 rows are included)."""
+    fn = getattr(sf, "query_all", None)
+    if callable(fn):
+        out = fn(soql)
+        return list(out.get("records") or [])
+    out = sf.query(soql)
+    return list(out.get("records") or [])
+
+
+def _format_quote_lines_for_ui(line_details: List[Dict[str, Any]]) -> str:
+    """Plain-text table of every quote line for UI / Claude (no omitted rows)."""
+    if not line_details:
+        return "(No quote line items)"
+    lines_out = [
+        "Line# | Product | Qty | Unit price | Subtotal | Total",
+        "------|---------|-----|-------------|----------|------",
+    ]
+    for row in line_details:
+        ln = row.get("LineNumber")
+        if ln is None:
+            ln = "-"
+        name = row.get("ProductName") or row.get("Description") or "(no name)"
+        name = str(name).replace("|", "/")
+        lines_out.append(
+            f"{ln} | {name} | {row.get('Quantity')} | {row.get('UnitPrice')} | "
+            f"{row.get('Subtotal')} | {row.get('TotalPrice')}"
+        )
+    return "\n".join(lines_out)
+
+
 def get_quote_tools() -> List[Dict[str, Any]]:
     """Return list of quote-related MCP tools"""
     return [
+        {
+            "name": "SALESFORCE_SET_QUOTE_STATUS",
+            "description": (
+                "**Use this after the user accepts or rejects a quote.** Sets Quote.Status. "
+                "Arguments: quote_id (or quoteId), decision = 'accept' or 'reject' (also accepted: "
+                "approved / rejected). Same as SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "quote_id": {"type": "string", "description": "15 or 18 character Quote Id (0Q0...)"},
+                    "quoteId": {"type": "string"},
+                    "decision": {
+                        "type": "string",
+                        "description": "accept | reject (case-insensitive; accept also allows approve/approved)",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Optional synonym for decision: accept or reject",
+                    },
+                },
+                "required": [],
+            },
+        },
         {
             "name": "create_quote_from_opportunity",
             "description": (
                 "Create a standard Quote and QuoteLineItems from an Opportunity's line items. "
                 "Returns full quote and line details plus instructions for the user to accept or reject "
-                f"in the UI; then call SALESFORCE_ACCEPT_QUOTE or SALESFORCE_REJECT_QUOTE (Status → "
-                f"'{QUOTE_STATUS_ACCEPTED}' / '{QUOTE_STATUS_REJECTED}'). "
+                f"in the UI; then call **SALESFORCE_SET_QUOTE_STATUS** with quote_id and decision "
+                f"'accept' or 'reject' (Status → '{QUOTE_STATUS_ACCEPTED}' / '{QUOTE_STATUS_REJECTED}'). "
+                "Aliases: SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE. "
                 f"Override picklist values with env SF_QUOTE_STATUS_ACCEPTED / SF_QUOTE_STATUS_REJECTED."
             ),
             "inputSchema": {
@@ -46,7 +102,10 @@ def get_quote_tools() -> List[Dict[str, Any]]:
         },
         {
             "name": "SALESFORCE_CREATE_QUOTE_FROM_OPPORTUNITY",
-            "description": "Same as create_quote_from_opportunity (normalized MCP name).",
+            "description": (
+                "Same as create_quote_from_opportunity. After creation, use SALESFORCE_SET_QUOTE_STATUS "
+                "to accept or reject."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -124,6 +183,9 @@ def handle_quote_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[st
             }
         return create_quote_logic(sf, opportunity_id)
 
+    if t == "SALESFORCE_SET_QUOTE_STATUS":
+        return set_quote_status_by_decision(sf, _normalize_quote_id_args(arguments))
+
     if t == "SALESFORCE_ACCEPT_QUOTE":
         return set_quote_status_tool(sf, _normalize_quote_id_args(arguments), QUOTE_STATUS_ACCEPTED)
 
@@ -131,6 +193,29 @@ def handle_quote_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[st
         return set_quote_status_tool(sf, _normalize_quote_id_args(arguments), QUOTE_STATUS_REJECTED)
 
     raise ValueError(f"Unknown quote tool: {tool_name}")
+
+
+def set_quote_status_by_decision(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve decision accept/reject and delegate to set_quote_status_tool."""
+    raw = (
+        arguments.get("decision")
+        or arguments.get("status")
+        or arguments.get("action")
+        or ""
+    )
+    d = str(raw).strip().lower()
+    if d in ("accept", "accepted", "approve", "approved", "yes", "ok", "true", "1"):
+        return set_quote_status_tool(sf, arguments, QUOTE_STATUS_ACCEPTED)
+    if d in ("reject", "rejected", "deny", "denied", "decline", "declined", "no", "false", "0"):
+        return set_quote_status_tool(sf, arguments, QUOTE_STATUS_REJECTED)
+    return {
+        "success": False,
+        "error": (
+            "SALESFORCE_SET_QUOTE_STATUS requires decision (or status) of 'accept' or 'reject' "
+            f"(got {raw!r})."
+        ),
+        "errorMessage": "decision must be accept or reject",
+    }
 
 
 def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Dict[str, Any]:
@@ -161,6 +246,9 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
             "quote_id": qid,
             "status": status,
             "quote": snap.get("quote"),
+            "quote_line_details": snap.get("quote_line_details"),
+            "quote_line_details_count": snap.get("quote_line_details_count"),
+            "ui_formatted_quote_lines": snap.get("ui_formatted_quote_lines"),
             "message": f"Quote status set to {status}.",
         }
     except Exception as e:
@@ -185,8 +273,7 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
         "Description, PricebookEntry.Product2.Name, PricebookEntry.Product2.ProductCode "
         f"FROM QuoteLineItem WHERE QuoteId = '{esc}' ORDER BY LineNumber, CreatedDate"
     )
-    lr = sf.query(q_li)
-    lines = lr.get("records") or []
+    lines = _soql_query_all_records(sf, q_li)
 
     line_details: List[Dict[str, Any]] = []
     for row in lines:
@@ -208,7 +295,12 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
             }
         )
 
-    return {"quote": quote_row, "quote_line_details": line_details}
+    return {
+        "quote": quote_row,
+        "quote_line_details": line_details,
+        "quote_line_details_count": len(line_details),
+        "ui_formatted_quote_lines": _format_quote_lines_for_ui(line_details),
+    }
 
 
 def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
@@ -229,6 +321,8 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
         "quoteLines": [],
         "quote": None,
         "quote_line_details": [],
+        "quote_line_details_count": 0,
+        "ui_formatted_quote_lines": None,
         "ui_prompt_for_user": None,
         "next_tools": None,
         "errorMessage": None,
@@ -289,12 +383,12 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
             FROM OpportunityLineItem
             WHERE OpportunityId = '{esc_opp_inner}'
         """
-        oli_result = sf.query(oli_query)
+        oli_rows = _soql_query_all_records(sf, oli_query)
 
         created_line_summaries: List[Dict[str, Any]] = []
-        if oli_result.get("records"):
+        if oli_rows:
             qli_sf = SFType("QuoteLineItem", sf.session_id, sf.sf_instance)
-            for oli in oli_result["records"]:
+            for oli in oli_rows:
                 pricebook_entry_id = oli.get("PricebookEntryId")
                 if not pricebook_entry_id:
                     continue
@@ -326,24 +420,46 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
         snap = _fetch_quote_snapshot(sf, quote_id)
         result["quote"] = snap.get("quote")
         result["quote_line_details"] = snap.get("quote_line_details") or []
+        result["quote_line_details_count"] = snap.get("quote_line_details_count") or len(
+            result["quote_line_details"]
+        )
+        result["ui_formatted_quote_lines"] = snap.get("ui_formatted_quote_lines") or _format_quote_lines_for_ui(
+            result["quote_line_details"]
+        )
+        if result["quoteLineCount"] != result["quote_line_details_count"]:
+            result["quote_line_count_mismatch_warning"] = (
+                f"Created {result['quoteLineCount']} line(s) from the opportunity but SOQL returned "
+                f"{result['quote_line_details_count']} quote line detail row(s); verify in Salesforce."
+            )
 
         result["ui_prompt_for_user"] = (
-            "Review the quote summary and line items above. "
-            "When the user decides in the UI: if they **accept**, call tool **SALESFORCE_ACCEPT_QUOTE** "
-            f"with quote_id **{quote_id}** (sets Status to '{QUOTE_STATUS_ACCEPTED}'). "
-            "If they **reject**, call **SALESFORCE_REJECT_QUOTE** with the same quote_id "
-            f"(sets Status to '{QUOTE_STATUS_REJECTED}')."
+            "Display **every** quote line to the user: use the full `ui_formatted_quote_lines` text "
+            "(or the `quote_line_details` array) and **do not** summarize or omit rows. "
+            "Then ask them to accept or reject. To record their choice on this MCP server, call "
+            "**SALESFORCE_SET_QUOTE_STATUS** with "
+            f"quote_id **{quote_id}** and decision **accept** or **reject** "
+            f"(sets Status to '{QUOTE_STATUS_ACCEPTED}' or '{QUOTE_STATUS_REJECTED}'). "
+            "Equivalent tools: SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE with the same quote_id."
         )
         result["next_tools"] = {
             "on_user_accept": {
-                "tool": "SALESFORCE_ACCEPT_QUOTE",
-                "arguments": {"quote_id": quote_id},
+                "tool": "SALESFORCE_SET_QUOTE_STATUS",
+                "arguments": {"quote_id": quote_id, "decision": "accept"},
             },
             "on_user_reject": {
-                "tool": "SALESFORCE_REJECT_QUOTE",
-                "arguments": {"quote_id": quote_id},
+                "tool": "SALESFORCE_SET_QUOTE_STATUS",
+                "arguments": {"quote_id": quote_id, "decision": "reject"},
+            },
+            "aliases": {
+                "accept_tool": "SALESFORCE_ACCEPT_QUOTE",
+                "reject_tool": "SALESFORCE_REJECT_QUOTE",
             },
         }
+        result["mcp_tool_names_for_quote_status"] = [
+            "SALESFORCE_SET_QUOTE_STATUS",
+            "SALESFORCE_ACCEPT_QUOTE",
+            "SALESFORCE_REJECT_QUOTE",
+        ]
 
         result["success"] = True
         print(f"[Quote] Created quote {quote_id} for Opp {opp['Id']} ({result['quoteLineCount']} lines)", file=sys.stderr)
