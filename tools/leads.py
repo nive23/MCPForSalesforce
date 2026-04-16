@@ -85,8 +85,9 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                 "Creates a new lead; parses product_description into Product2 + Lead_Product__c rows "
                 "(e.g. 'One Basic Laptop Bundle' -> qty 1, product Basic Laptop Bundle). "
                 "Comma-separated values create multiple Lead_Product__c records. "
-                "Owner defaults to Anand S (override with owner_id or env SF_DEFAULT_LEAD_OWNER_NAME / "
-                "SF_DEFAULT_LEAD_OWNER_ID)."
+                "Owner defaults to Anand S: prefer SF_DEFAULT_LEAD_OWNER_USERNAME (exact User.Username) "
+                "or SF_DEFAULT_LEAD_OWNER_ID; else User.Name match. After create, OwnerId is verified and "
+                "PATCHed once if Salesforce stored a different owner."
             ),
             "inputSchema": {
                 "type": "object",
@@ -170,7 +171,7 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                     },
                     "owner_id": {
                         "type": "string",
-                        "description": "Optional 15/18 char User Id for Lead OwnerId. Overrides default owner (Anand S).",
+                        "description": "Optional 15/18 char User Id for Lead OwnerId. Overrides env defaults.",
                     },
                     "Product_Description__c": {
                         "type": "string",
@@ -397,7 +398,8 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 )
             resolved_products.append((qty, pname, pid))
 
-        owner_id = _resolve_lead_owner_id(sf, arguments)
+        owner_user = _resolve_lead_owner_user(sf, arguments)
+        owner_id = owner_user["id"]
 
         company_raw = arguments.get("company")
         company = str(company_raw).strip() if company_raw is not None else ""
@@ -442,19 +444,39 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         result = lead_sf.create(lead_data)
 
         lead_id = result["id"]
-        print(f"[Lead] Created lead: {lead_id} owner={owner_id}", file=sys.stderr)
+        print(
+            f"[Lead] Created lead: {lead_id} owner={owner_id} "
+            f"user.Name={owner_user.get('Name')!r} Username={owner_user.get('Username')!r}",
+            file=sys.stderr,
+        )
+
+        owner_sync = _ensure_lead_owner_matches(sf, lead_id, owner_id)
+        if owner_sync.get("patched"):
+            print(
+                f"[Lead] Owner after PATCH: {owner_sync.get('after')}",
+                file=sys.stderr,
+            )
 
         lp_ids, lp_details = _create_lead_product_rows_resolved(sf, lead_id, resolved_products)
         print(f"[Lead] Created {len(lp_ids)} Lead_Product__c row(s) for lead {lead_id}", file=sys.stderr)
 
-        return {
+        out: Dict[str, Any] = {
             "success": True,
             "lead_id": lead_id,
             "owner_id": owner_id,
+            "owner_resolved_name": owner_user.get("Name") or None,
+            "owner_resolved_username": owner_user.get("Username") or None,
+            "lead_owner_after_create": owner_sync.get("after"),
+            "owner_patched_after_create": bool(owner_sync.get("patched")),
             "lead_product_ids": lp_ids,
             "lead_products": lp_details,
             "message": f"Lead '{str(first_name).strip()} {str(last_name).strip()}' created successfully",
         }
+        if owner_sync.get("before"):
+            out["lead_owner_before_patch"] = owner_sync.get("before")
+        if owner_sync.get("patch_error"):
+            out["owner_patch_error"] = owner_sync["patch_error"]
+        return out
     
     except Exception as e:
         error_msg = str(e)
@@ -626,27 +648,160 @@ def _query_product2_id_by_name(sf: Any, product_name: str) -> Optional[str]:
     return None
 
 
-def _resolve_lead_owner_id(sf: Any, arguments: Dict[str, Any]) -> str:
-    """OwnerId for new Lead: owner_id arg, or SF_DEFAULT_LEAD_OWNER_ID, or User named SF_DEFAULT_LEAD_OWNER_NAME / Anand S."""
+def _resolve_lead_owner_user(sf: Any, arguments: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Resolve Lead Owner User. Returns dict: id, Name, Username (for logs and API response).
+    Precedence: owner_id / OwnerId, SF_DEFAULT_LEAD_OWNER_ID, SF_DEFAULT_LEAD_OWNER_USERNAME,
+    User.Name = SF_DEFAULT_LEAD_OWNER_NAME, then FirstName + LastName split on last token.
+    """
     oid = arguments.get("owner_id") or arguments.get("OwnerId")
     if oid and str(oid).strip():
-        return str(oid).strip()
+        uid = str(oid).strip()
+        row = _query_user_row_by_id(sf, uid)
+        if row:
+            return {
+                "id": uid,
+                "Name": str(row.get("Name") or ""),
+                "Username": str(row.get("Username") or ""),
+            }
+        return {"id": uid, "Name": "", "Username": ""}
+
     env_id = os.getenv("SF_DEFAULT_LEAD_OWNER_ID", "").strip()
     if env_id:
-        return env_id
+        row = _query_user_row_by_id(sf, env_id)
+        if row:
+            return {
+                "id": env_id,
+                "Name": str(row.get("Name") or ""),
+                "Username": str(row.get("Username") or ""),
+            }
+        return {"id": env_id, "Name": "", "Username": ""}
+
+    uname = os.getenv("SF_DEFAULT_LEAD_OWNER_USERNAME", "").strip()
+    if uname:
+        esc = _lead_escape(uname)
+        q = (
+            f"SELECT Id, Name, Username FROM User WHERE Username = '{esc}' "
+            f"AND IsActive = true LIMIT 1"
+        )
+        res = sf.query(q)
+        recs = res.get("records") or []
+        if not recs:
+            raise ValueError(
+                f"No active User with Username = '{uname}'. Check SF_DEFAULT_LEAD_OWNER_USERNAME."
+            )
+        r = recs[0]
+        return {
+            "id": str(r["Id"]),
+            "Name": str(r.get("Name") or ""),
+            "Username": str(r.get("Username") or ""),
+        }
+
     name = os.getenv("SF_DEFAULT_LEAD_OWNER_NAME", DEFAULT_LEAD_OWNER_NAME).strip()
     if not name:
-        raise ValueError("Lead owner: set owner_id, SF_DEFAULT_LEAD_OWNER_ID, or SF_DEFAULT_LEAD_OWNER_NAME")
+        raise ValueError(
+            "Lead owner: set owner_id, SF_DEFAULT_LEAD_OWNER_ID, SF_DEFAULT_LEAD_OWNER_USERNAME, "
+            "or SF_DEFAULT_LEAD_OWNER_NAME"
+        )
     esc = _lead_escape(name)
-    q = f"SELECT Id FROM User WHERE Name = '{esc}' AND IsActive = true LIMIT 1"
+    q = (
+        f"SELECT Id, Name, Username FROM User WHERE Name = '{esc}' "
+        f"AND IsActive = true ORDER BY CreatedDate ASC LIMIT 5"
+    )
+    res = sf.query(q)
+    recs = res.get("records") or []
+    if len(recs) == 1:
+        r = recs[0]
+        return {
+            "id": str(r["Id"]),
+            "Name": str(r.get("Name") or ""),
+            "Username": str(r.get("Username") or ""),
+        }
+    if len(recs) > 1:
+        raise ValueError(
+            f"Multiple active Users have Name = '{name}' ({len(recs)} rows). "
+            "Set SF_DEFAULT_LEAD_OWNER_USERNAME or SF_DEFAULT_LEAD_OWNER_ID to pick one."
+        )
+
+    parts = name.split()
+    if len(parts) >= 2:
+        fn = _lead_escape(parts[0])
+        ln = _lead_escape(" ".join(parts[1:]))
+        q2 = (
+            f"SELECT Id, Name, Username FROM User WHERE FirstName = '{fn}' "
+            f"AND LastName = '{ln}' AND IsActive = true ORDER BY CreatedDate ASC LIMIT 5"
+        )
+        res2 = sf.query(q2)
+        recs2 = res2.get("records") or []
+        if len(recs2) == 1:
+            r = recs2[0]
+            return {
+                "id": str(r["Id"]),
+                "Name": str(r.get("Name") or ""),
+                "Username": str(r.get("Username") or ""),
+            }
+        if len(recs2) > 1:
+            raise ValueError(
+                f"Multiple Users match FirstName/LastName for '{name}'. "
+                "Set SF_DEFAULT_LEAD_OWNER_USERNAME or SF_DEFAULT_LEAD_OWNER_ID."
+            )
+
+    raise ValueError(
+        f"No active User found for owner '{name}'. Set SF_DEFAULT_LEAD_OWNER_USERNAME "
+        f"(recommended), SF_DEFAULT_LEAD_OWNER_ID, or owner_id on the tool call."
+    )
+
+
+def _query_user_row_by_id(sf: Any, user_id: str) -> Optional[Dict[str, Any]]:
+    esc = _lead_escape(str(user_id).strip())
+    q = f"SELECT Id, Name, Username FROM User WHERE Id = '{esc}' LIMIT 1"
+    res = sf.query(q)
+    recs = res.get("records") or []
+    return recs[0] if recs else None
+
+
+def _query_lead_owner_snapshot(sf: Any, lead_id: str) -> Dict[str, str]:
+    esc = _lead_escape(str(lead_id).strip())
+    q = f"SELECT Id, OwnerId, Owner.Name FROM Lead WHERE Id = '{esc}' LIMIT 1"
     res = sf.query(q)
     recs = res.get("records") or []
     if not recs:
-        raise ValueError(
-            f"No active User found with Name = '{name}'. Set owner_id to a User Id or fix "
-            "SF_DEFAULT_LEAD_OWNER_NAME / SF_DEFAULT_LEAD_OWNER_ID."
-        )
-    return str(recs[0]["Id"])
+        return {"OwnerId": "", "Owner_Name": ""}
+    r = recs[0]
+    owner = r.get("Owner") or {}
+    return {
+        "OwnerId": str(r.get("OwnerId") or ""),
+        "Owner_Name": str(owner.get("Name") or ""),
+    }
+
+
+def _ensure_lead_owner_matches(sf: Any, lead_id: str, owner_id: str) -> Dict[str, Any]:
+    """
+    If Lead.OwnerId in Salesforce differs from owner_id, PATCH OwnerId once (flows may adjust it).
+    Returns { patched: bool, after: snapshot dict }.
+    """
+    snap = _query_lead_owner_snapshot(sf, lead_id)
+    want = str(owner_id).strip()
+    if snap.get("OwnerId") == want:
+        return {"patched": False, "after": snap}
+    print(
+        f"[Lead] Owner mismatch after create: stored={snap.get('OwnerId')} ({snap.get('Owner_Name')}) "
+        f"wanted={want}; PATCHing OwnerId",
+        file=sys.stderr,
+    )
+    lead_sf = SFType("Lead", sf.session_id, sf.sf_instance)
+    try:
+        lead_sf.update(lead_id, {"OwnerId": want})
+    except Exception as ex:
+        print(f"[Lead ERROR] Owner PATCH failed: {ex}", file=sys.stderr)
+        return {
+            "patched": False,
+            "after": snap,
+            "before": snap,
+            "patch_error": str(ex),
+        }
+    snap2 = _query_lead_owner_snapshot(sf, lead_id)
+    return {"patched": True, "after": snap2, "before": snap}
 
 
 def _create_lead_product_rows_resolved(
