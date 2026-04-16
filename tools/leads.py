@@ -35,6 +35,9 @@ def invalidate_salesforce_session() -> None:
         setattr(_sf_cfg, "_sf_client", None)
         setattr(_sf_cfg, "_auth_time", None)
 
+# Apex REST lead convert (same Bearer as Data API). Path segment after /services/apexrest/
+DEFAULT_APEX_CONVERT_LEAD_PATH = "convertLead"
+
 # Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
 LEAD_PRODUCT_OBJECT = "Lead_Product__c"
 LEAD_PRODUCT_LEAD_FIELD = "Lead__c"
@@ -235,10 +238,10 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                 "always creates an Opportunity named after the lead, overwriteLeadSource=false, "
                 "no owner notification email, converted status 'Converted', then standard price book, "
                 "Lead_Product__c line items, and Opportunity_PlatformEvent__e. "
-                "Uses REST LeadConvert quick action when available; if that returns 404, falls back to "
-                "SOAP Partner convertLead. If JWT is rejected by SOAP (Illegal Session), set env "
-                "SF_SOAP_PASSWORD to the integration user's password+security token for SOAP login(), "
-                "or enable REST LeadConvert / Apex REST in the org."
+                "Tries Apex REST POST /services/apexrest/convertLead first (JWT), then REST LeadConvert "
+                "quick action, then SOAP Partner convertLead. Set SF_APEX_CONVERT_LEAD_DISABLED=1 to skip "
+                "Apex. Optional SF_APEX_CONVERT_LEAD_PATH overrides the path segment (default convertLead). "
+                "If SOAP fails with Illegal Session, set SF_SOAP_PASSWORD for SOAP login()."
             ),
             "inputSchema": {
                 "type": "object",
@@ -831,6 +834,88 @@ def _parse_lead_convert_response(resp: Any) -> Tuple[Optional[str], Optional[str
     return acc, con, opp
 
 
+def _parse_apex_convert_lead_response(data: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse JSON from POST /services/apexrest/convertLead (custom Apex shapes)."""
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        return None, None, None
+    inner: Any = data
+    for key in ("result", "data", "output", "response"):
+        if isinstance(data.get(key), dict):
+            inner = data[key]
+            break
+    if not isinstance(inner, dict):
+        return None, None, None
+    acc = (
+        inner.get("accountId")
+        or inner.get("AccountId")
+        or inner.get("account_id")
+    )
+    con = (
+        inner.get("contactId")
+        or inner.get("ContactId")
+        or inner.get("contact_id")
+    )
+    opp = (
+        inner.get("opportunityId")
+        or inner.get("OpportunityId")
+        or inner.get("opportunity_id")
+    )
+    return acc, con, opp
+
+
+def _try_convert_lead_apex_rest(
+    sf: Any,
+    lead_id: str,
+    converted_status: str,
+    opportunity_name: str,
+) -> Optional[Tuple[str, str, str]]:
+    """
+    POST /services/apexrest/<path> with OAuth Bearer (same token as REST API).
+    Returns (accountId, contactId, opportunityId) on success, None if disabled or 404 (no route).
+    """
+    if os.getenv("SF_APEX_CONVERT_LEAD_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return None
+    path_seg = (
+        os.getenv("SF_APEX_CONVERT_LEAD_PATH", DEFAULT_APEX_CONVERT_LEAD_PATH).strip().strip("/")
+        or DEFAULT_APEX_CONVERT_LEAD_PATH
+    )
+    url = f"https://{sf.sf_instance}/services/apexrest/{path_seg}"
+    body: Dict[str, Any] = {
+        "leadID": str(lead_id).strip(),
+        "convertedStatus": str(converted_status).strip(),
+        "createOpportunity": True,
+        "opportunityName": str(opportunity_name).strip(),
+        "sendEmailToOwner": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {sf.session_id}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    resp = requests.post(url, json=body, headers=headers, timeout=120)
+    if resp.status_code == 404:
+        return None
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Apex convertLead HTTP {resp.status_code}: {resp.text[:2500]}")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Apex convertLead: response was not JSON: {resp.text[:2500]}") from None
+    if isinstance(data, dict) and data.get("success") is False:
+        msg = data.get("message") or data.get("error") or data.get("errors") or data
+        raise RuntimeError(f"Apex convertLead reported failure: {msg}")
+    acc, con, opp = _parse_apex_convert_lead_response(data)
+    if acc and con and opp:
+        return str(acc), str(con), str(opp)
+    if acc or con or opp:
+        raise RuntimeError(
+            f"Apex convertLead returned incomplete ids (account={acc!r}, contact={con!r}, opp={opp!r}): {data!r}"
+        )
+    raise RuntimeError(f"Apex convertLead returned no account/contact/opportunity ids: {data!r}")
+
+
 def _get_standard_pricebook_id(sf: Any) -> str:
     q = "SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1"
     res = sf.query(q)
@@ -910,8 +995,8 @@ def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str)
 
 def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
     """
-    Single attempt: REST LeadConvert or SOAP fallback, then post-convert steps.
-    Raises on failure so caller can retry after session refresh.
+    Single attempt: Apex REST convertLead, then REST quick action LeadConvert, then SOAP;
+    then post-convert steps. Raises on failure so caller can retry after session refresh.
     """
     lead_row = _query_lead_row_by_id(sf, lead_id)
     if not lead_row:
@@ -932,18 +1017,26 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
     }
 
     path = f"sobjects/Lead/{lead_id}/actions/quick/LeadConvert"
-    convert_via = "rest"
     acc_id: Optional[str] = None
     con_id: Optional[str] = None
     opp_id: Optional[str] = None
-    try:
-        raw = sf.restful(path, method="POST", json=payload)
-        acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
-    except SalesforceResourceNotFound:
-        convert_via = "soap"
-        acc_id, con_id, opp_id = _convert_lead_soap(
-            sf, str(lead_id), converted_status, str(opportunity_name).strip()
-        )
+    convert_via = "rest"
+
+    apex_triplet = _try_convert_lead_apex_rest(
+        sf, str(lead_id), converted_status, str(opportunity_name).strip()
+    )
+    if apex_triplet:
+        acc_id, con_id, opp_id = apex_triplet
+        convert_via = "apex_rest"
+    else:
+        try:
+            raw = sf.restful(path, method="POST", json=payload)
+            acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
+        except SalesforceResourceNotFound:
+            convert_via = "soap"
+            acc_id, con_id, opp_id = _convert_lead_soap(
+                sf, str(lead_id), converted_status, str(opportunity_name).strip()
+            )
 
     if not acc_id and not con_id:
         raise RuntimeError("Lead convert returned no account or contact id")
@@ -978,8 +1071,8 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
 
 def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Convert a lead via REST quick action LeadConvert: always new Account/Contact, always Opportunity,
-    then standard price book, platform event, and Lead_Product__c line items.
+    Convert a lead: Apex REST /services/apexrest/convertLead when available, else REST quick action
+    LeadConvert, else SOAP; then standard price book, platform event, and Lead_Product__c line items.
     Retries once after a fresh JWT login if the session is invalid (SOAP/REST).
     """
     args = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
