@@ -3,6 +3,7 @@ Lead Operations
 Handles Salesforce Lead creation, campaign membership, and lead conversion
 """
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from typing import Dict, Any, List, Optional, Tuple
@@ -43,6 +44,35 @@ LEAD_PRODUCT_OBJECT = "Lead_Product__c"
 LEAD_PRODUCT_LEAD_FIELD = "Lead__c"
 LEAD_PRODUCT_PRODUCT_FIELD = "Product__c"
 LEAD_PRODUCT_QUANTITY_FIELD = "Quantity__c"
+# Default Lead owner when not overridden (env SF_DEFAULT_LEAD_OWNER_ID or SF_DEFAULT_LEAD_OWNER_NAME)
+DEFAULT_LEAD_OWNER_NAME = "Anand S"
+_WORD_TO_QTY: Dict[str, float] = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+}
+_RE_LEADING_NUMBER = re.compile(r"^(\d+(?:\.\d+)?)\s+(.+)$")
 OPPORTUNITY_PLATFORM_EVENT_OBJECT = "Opportunity_PlatformEvent__e"
 OPPORTUNITY_PLATFORM_EVENT_OPP_FIELD = "OpportunityId__c"
 
@@ -51,7 +81,13 @@ def get_lead_tools() -> List[Dict[str, Any]]:
     return [
         {
             "name": "SALESFORCE_CREATE_LEAD",
-            "description": "Creates a new lead in Salesforce with the specified information.",
+            "description": (
+                "Creates a new lead; parses product_description into Product2 + Lead_Product__c rows "
+                "(e.g. 'One Basic Laptop Bundle' -> qty 1, product Basic Laptop Bundle). "
+                "Comma-separated values create multiple Lead_Product__c records. "
+                "Owner defaults to Anand S (override with owner_id or env SF_DEFAULT_LEAD_OWNER_NAME / "
+                "SF_DEFAULT_LEAD_OWNER_ID)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -125,7 +161,16 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                     },
                     "product_description": {
                         "type": "string",
-                        "description": "Product description (required) - stored in Product_Description__c (e.g., One Basic Laptop Bundle)."
+                        "description": (
+                            "Required. Stored on Lead Product_Description__c. Also parsed to create "
+                            "Lead_Product__c rows: optional leading quantity (word or number) then product "
+                            "name matching Product2.Name (e.g. 'One Basic Laptop Bundle'). "
+                            "Multiple entries: comma-separated (e.g. 'One Basic Laptop Bundle, 2 USB Hub')."
+                        ),
+                    },
+                    "owner_id": {
+                        "type": "string",
+                        "description": "Optional 15/18 char User Id for Lead OwnerId. Overrides default owner (Anand S).",
                     },
                     "Product_Description__c": {
                         "type": "string",
@@ -239,9 +284,9 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                 "no owner notification email, converted status 'Converted', then standard price book, "
                 "Lead_Product__c line items, and Opportunity_PlatformEvent__e. "
                 "Tries Apex REST POST /services/apexrest/convertLead first (JWT), then REST LeadConvert "
-                "quick action, then SOAP Partner convertLead. Set SF_APEX_CONVERT_LEAD_DISABLED=1 to skip "
-                "Apex. Optional SF_APEX_CONVERT_LEAD_PATH overrides the path segment (default convertLead). "
-                "If SOAP fails with Illegal Session, set SF_SOAP_PASSWORD for SOAP login()."
+                "quick action, then SOAP only if SF_SOAP_PASSWORD is set or SF_SOAP_ALLOW_JWT=1. "
+                "Set SF_APEX_CONVERT_LEAD_DISABLED=1 to skip Apex. SF_APEX_CONVERT_LEAD_PATH overrides "
+                "the apexrest path segment (default convertLead)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -337,6 +382,23 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         if not product_description or not str(product_description).strip():
             raise ValueError("Product description is required")
 
+        pd_text = str(product_description).strip()
+        segments = _parse_product_description_segments(pd_text)
+        if not segments:
+            raise ValueError(
+                "Product description must list at least one product (e.g. 'One Basic Laptop Bundle')."
+            )
+        resolved_products: List[Tuple[float, str, str]] = []
+        for qty, pname in segments:
+            pid = _query_product2_id_by_name(sf, pname)
+            if not pid:
+                raise ValueError(
+                    f"No active Product2 found with Name matching '{pname}' (check Product2.Name in Salesforce)."
+                )
+            resolved_products.append((qty, pname, pid))
+
+        owner_id = _resolve_lead_owner_id(sf, arguments)
+
         company_raw = arguments.get("company")
         company = str(company_raw).strip() if company_raw is not None else ""
         if not company:
@@ -348,7 +410,7 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
             "Company": company,
             "Email": str(email).strip(),
             "AnnualRevenue": annual_revenue,
-            "Product_Description__c": str(product_description).strip(),
+            "Product_Description__c": pd_text,
         }
 
         optional_fields = [
@@ -372,19 +434,26 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         if custom_fields:
             lead_data.update(custom_fields)
 
-        lead_data["Product_Description__c"] = str(product_description).strip()
-        
+        lead_data["Product_Description__c"] = pd_text
+        lead_data["OwnerId"] = owner_id
+
         # Create lead
         lead_sf = SFType('Lead', sf.session_id, sf.sf_instance)
         result = lead_sf.create(lead_data)
-        
+
         lead_id = result["id"]
-        print(f"[Lead] Created lead: {lead_id}", file=sys.stderr)
-        
+        print(f"[Lead] Created lead: {lead_id} owner={owner_id}", file=sys.stderr)
+
+        lp_ids, lp_details = _create_lead_product_rows_resolved(sf, lead_id, resolved_products)
+        print(f"[Lead] Created {len(lp_ids)} Lead_Product__c row(s) for lead {lead_id}", file=sys.stderr)
+
         return {
             "success": True,
             "lead_id": lead_id,
-            "message": f"Lead '{str(first_name).strip()} {str(last_name).strip()}' created successfully"
+            "owner_id": owner_id,
+            "lead_product_ids": lp_ids,
+            "lead_products": lp_details,
+            "message": f"Lead '{str(first_name).strip()} {str(last_name).strip()}' created successfully",
         }
     
     except Exception as e:
@@ -493,6 +562,132 @@ def list_leads(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _lead_escape(s: str) -> str:
     return str(s).replace("'", "''")
+
+
+def _parse_one_product_segment(segment: str) -> Tuple[float, str]:
+    """
+    'One Basic Laptop Bundle' -> (1.0, 'Basic Laptop Bundle')
+    '2 USB Hub' -> (2.0, 'USB Hub')
+    'Basic Laptop Bundle' -> (1.0, 'Basic Laptop Bundle')  # no leading qty => 1
+    """
+    raw = " ".join(str(segment).strip().split())
+    if not raw:
+        return 1.0, ""
+    m = _RE_LEADING_NUMBER.match(raw)
+    if m:
+        try:
+            return float(m.group(1)), str(m.group(2)).strip()
+        except ValueError:
+            pass
+    parts = raw.split(None, 1)
+    w0 = parts[0].lower()
+    if w0 in _WORD_TO_QTY:
+        qty = float(_WORD_TO_QTY[w0])
+        name = parts[1].strip() if len(parts) > 1 else ""
+        return qty, name
+    return 1.0, raw
+
+
+def _parse_product_description_segments(product_description: str) -> List[Tuple[float, str]]:
+    """Split on commas; each segment -> (quantity, product_name)."""
+    out: List[Tuple[float, str]] = []
+    for piece in str(product_description).split(","):
+        qty, pname = _parse_one_product_segment(piece)
+        pname = pname.strip()
+        if pname:
+            out.append((qty, pname))
+    return out
+
+
+def _query_product2_id_by_name(sf: Any, product_name: str) -> Optional[str]:
+    """Resolve active Product2 Id by Name (exact, then case-insensitive within LIKE prefix scan)."""
+    n = " ".join(str(product_name).strip().split())
+    if not n:
+        return None
+    esc = _lead_escape(n)
+    q = (
+        f"SELECT Id, Name FROM Product2 WHERE IsActive = true AND Name = '{esc}' LIMIT 1"
+    )
+    r = sf.query(q)
+    recs = r.get("records") or []
+    if recs:
+        return str(recs[0]["Id"])
+    first = n.split()[0][:40] if n.split() else n[:40]
+    esc_first = _lead_escape(first)
+    q2 = (
+        f"SELECT Id, Name FROM Product2 WHERE IsActive = true AND Name LIKE '{esc_first}%' LIMIT 200"
+    )
+    r2 = sf.query(q2)
+    want = n.casefold()
+    for row in r2.get("records") or []:
+        nm = (row.get("Name") or "").strip()
+        if nm.casefold() == want:
+            return str(row["Id"])
+    return None
+
+
+def _resolve_lead_owner_id(sf: Any, arguments: Dict[str, Any]) -> str:
+    """OwnerId for new Lead: owner_id arg, or SF_DEFAULT_LEAD_OWNER_ID, or User named SF_DEFAULT_LEAD_OWNER_NAME / Anand S."""
+    oid = arguments.get("owner_id") or arguments.get("OwnerId")
+    if oid and str(oid).strip():
+        return str(oid).strip()
+    env_id = os.getenv("SF_DEFAULT_LEAD_OWNER_ID", "").strip()
+    if env_id:
+        return env_id
+    name = os.getenv("SF_DEFAULT_LEAD_OWNER_NAME", DEFAULT_LEAD_OWNER_NAME).strip()
+    if not name:
+        raise ValueError("Lead owner: set owner_id, SF_DEFAULT_LEAD_OWNER_ID, or SF_DEFAULT_LEAD_OWNER_NAME")
+    esc = _lead_escape(name)
+    q = f"SELECT Id FROM User WHERE Name = '{esc}' AND IsActive = true LIMIT 1"
+    res = sf.query(q)
+    recs = res.get("records") or []
+    if not recs:
+        raise ValueError(
+            f"No active User found with Name = '{name}'. Set owner_id to a User Id or fix "
+            "SF_DEFAULT_LEAD_OWNER_NAME / SF_DEFAULT_LEAD_OWNER_ID."
+        )
+    return str(recs[0]["Id"])
+
+
+def _create_lead_product_rows_resolved(
+    sf: Any,
+    lead_id: str,
+    resolved: List[Tuple[float, str, str]],
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Create Lead_Product__c for each (quantity, product_name, product2_id).
+    Returns (new Lead_Product__c Ids, detail dicts for API response).
+    """
+    lp_sf = SFType(LEAD_PRODUCT_OBJECT, sf.session_id, sf.sf_instance)
+    created_ids: List[str] = []
+    details: List[Dict[str, Any]] = []
+    for qty, pname, pid in resolved:
+        name_label = pname[:80] if len(pname) <= 80 else pname[:77] + "..."
+        base_row: Dict[str, Any] = {
+            LEAD_PRODUCT_LEAD_FIELD: lead_id,
+            LEAD_PRODUCT_PRODUCT_FIELD: pid,
+            LEAD_PRODUCT_QUANTITY_FIELD: qty,
+        }
+        row = dict(base_row, Name=name_label)
+        try:
+            res = lp_sf.create(row)
+        except Exception as ex:
+            err = str(ex).upper()
+            if "NAME" in err or "INVALID_FIELD" in err or "DUPLICATE" in err:
+                res = lp_sf.create(base_row)
+            else:
+                raise
+        lid = str(res["id"])
+        created_ids.append(lid)
+        details.append(
+            {
+                "lead_product_id": lid,
+                "product2_id": pid,
+                "product_name": pname,
+                "quantity": qty,
+            }
+        )
+    return created_ids, details
 
 
 def search_leads(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -995,8 +1190,9 @@ def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str)
 
 def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
     """
-    Single attempt: Apex REST convertLead, then REST quick action LeadConvert, then SOAP;
-    then post-convert steps. Raises on failure so caller can retry after session refresh.
+    Single attempt: Apex REST convertLead, then REST quick action LeadConvert, then SOAP
+    (only if SF_SOAP_PASSWORD or SF_SOAP_ALLOW_JWT=1); then post-convert steps.
+    Raises on failure so caller can retry after session refresh.
     """
     lead_row = _query_lead_row_by_id(sf, lead_id)
     if not lead_row:
@@ -1033,6 +1229,26 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
             raw = sf.restful(path, method="POST", json=payload)
             acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
         except SalesforceResourceNotFound:
+            soap_pw = os.getenv("SF_SOAP_PASSWORD")
+            allow_jwt_soap = os.getenv("SF_SOAP_ALLOW_JWT", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if not (soap_pw and str(soap_pw).strip()) and not allow_jwt_soap:
+                print(
+                    "[Lead] Skipping Partner SOAP convertLead: no SF_SOAP_PASSWORD and "
+                    "SF_SOAP_ALLOW_JWT is not set (JWT-only SOAP fails in many orgs).",
+                    file=sys.stderr,
+                )
+                raise RuntimeError(
+                    "Lead convert: Apex REST /services/apexrest/convertLead was not used or returned 404, "
+                    "and REST quick action sobjects/Lead/.../actions/quick/LeadConvert returned 404. "
+                    "Partner SOAP with JWT is skipped by default. Fix: deploy the Apex REST convert "
+                    "endpoint, expose the LeadConvert quick action to the integration user, set "
+                    "SF_SOAP_PASSWORD for SOAP login(), or set SF_SOAP_ALLOW_JWT=1 to attempt legacy "
+                    "JWT SOAP (often INVALID_SESSION_ID / Illegal Session)."
+                )
             convert_via = "soap"
             acc_id, con_id, opp_id = _convert_lead_soap(
                 sf, str(lead_id), converted_status, str(opportunity_name).strip()
