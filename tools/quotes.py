@@ -3,6 +3,7 @@ Quote Operations
 Handles Salesforce Quote creation from opportunities, detail payloads for UI review,
 and accept/reject status updates.
 """
+import json
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -28,6 +29,35 @@ def _soql_query_all_records(sf: Any, soql: str) -> List[Dict[str, Any]]:
         return list(out.get("records") or [])
     out = sf.query(soql)
     return list(out.get("records") or [])
+
+
+def _opportunity_account_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Account on the Quote's Opportunity (Id, Name, Phone, Industry)."""
+    empty = {
+        "account_id": None,
+        "account_name": None,
+        "account_phone": None,
+        "account_industry": None,
+    }
+    if not quote_row or not isinstance(quote_row, dict):
+        return dict(empty)
+    opp = quote_row.get("Opportunity")
+    if not isinstance(opp, dict):
+        return dict(empty)
+    acc = opp.get("Account")
+    if isinstance(acc, dict):
+        return {
+            "account_id": acc.get("Id") or opp.get("AccountId"),
+            "account_name": acc.get("Name"),
+            "account_phone": acc.get("Phone"),
+            "account_industry": acc.get("Industry"),
+        }
+    return {
+        "account_id": opp.get("AccountId"),
+        "account_name": None,
+        "account_phone": None,
+        "account_industry": None,
+    }
 
 
 def _format_quote_lines_for_ui(line_details: List[Dict[str, Any]]) -> str:
@@ -240,6 +270,7 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
         quote_sf.update(qid, {"Status": status})
 
         snap = _fetch_quote_snapshot(sf, qid)
+        oa = snap.get("opportunity_account") or {}
         print(f"[Quote] Updated Quote {qid} Status={status}", file=sys.stderr)
         return {
             "success": True,
@@ -249,6 +280,11 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
             "quote_line_details": snap.get("quote_line_details"),
             "quote_line_details_count": snap.get("quote_line_details_count"),
             "ui_formatted_quote_lines": snap.get("ui_formatted_quote_lines"),
+            "opportunity_account": oa,
+            "accountId": oa.get("account_id"),
+            "accountName": oa.get("account_name"),
+            "accountPhone": oa.get("account_phone"),
+            "accountIndustry": oa.get("account_industry"),
             "message": f"Quote status set to {status}.",
         }
     except Exception as e:
@@ -261,7 +297,8 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
     esc = _soql_escape(quote_id)
     q_quote = (
         "SELECT Id, Name, Status, QuoteNumber, TotalPrice, Subtotal, ExpirationDate, "
-        "OpportunityId, Pricebook2Id, CreatedDate, LastModifiedDate "
+        "OpportunityId, Opportunity.AccountId, Opportunity.Account.Name, Opportunity.Account.Phone, "
+        "Opportunity.Account.Industry, Pricebook2Id, CreatedDate, LastModifiedDate "
         f"FROM Quote WHERE Id = '{esc}' LIMIT 1"
     )
     qr = sf.query(q_quote)
@@ -295,11 +332,13 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
             }
         )
 
+    oa = _opportunity_account_from_quote_row(quote_row)
     return {
         "quote": quote_row,
         "quote_line_details": line_details,
         "quote_line_details_count": len(line_details),
         "ui_formatted_quote_lines": _format_quote_lines_for_ui(line_details),
+        "opportunity_account": oa,
     }
 
 
@@ -323,6 +362,7 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
         "quote_line_details": [],
         "quote_line_details_count": 0,
         "ui_formatted_quote_lines": None,
+        "opportunity_account": None,
         "ui_prompt_for_user": None,
         "next_tools": None,
         "errorMessage": None,
@@ -426,36 +466,77 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
         result["ui_formatted_quote_lines"] = snap.get("ui_formatted_quote_lines") or _format_quote_lines_for_ui(
             result["quote_line_details"]
         )
+        oa_snap = snap.get("opportunity_account") or {}
+        result["opportunity_account"] = oa_snap
+        for src, dst in (
+            ("account_id", "accountId"),
+            ("account_name", "accountName"),
+            ("account_phone", "accountPhone"),
+            ("account_industry", "accountIndustry"),
+        ):
+            v = oa_snap.get(src)
+            if v is not None:
+                result[dst] = v
+
         if result["quoteLineCount"] != result["quote_line_details_count"]:
             result["quote_line_count_mismatch_warning"] = (
                 f"Created {result['quoteLineCount']} line(s) from the opportunity but SOQL returned "
                 f"{result['quote_line_details_count']} quote line detail row(s); verify in Salesforce."
             )
 
+        accept_patch = {"Status": QUOTE_STATUS_ACCEPTED}
+        reject_patch = {"Status": QUOTE_STATUS_REJECTED}
+        result["fallback_update_via_sobject_tool"] = {
+            "tool": "SALESFORCE_UPDATE_SOBJECT",
+            "note": (
+                "Registered at the top of tools/list. Use when quote-specific tools are missing from the MCP client."
+            ),
+            "on_user_accept": {
+                "sobject_type": "Quote",
+                "record_id": quote_id,
+                "fields": accept_patch,
+            },
+            "on_user_reject": {
+                "sobject_type": "Quote",
+                "record_id": quote_id,
+                "fields": reject_patch,
+            },
+        }
         result["ui_prompt_for_user"] = (
             "Display **every** quote line to the user: use the full `ui_formatted_quote_lines` text "
             "(or the `quote_line_details` array) and **do not** summarize or omit rows. "
-            "Then ask them to accept or reject. To record their choice on this MCP server, call "
-            "**SALESFORCE_SET_QUOTE_STATUS** with "
-            f"quote_id **{quote_id}** and decision **accept** or **reject** "
-            f"(sets Status to '{QUOTE_STATUS_ACCEPTED}' or '{QUOTE_STATUS_REJECTED}'). "
-            "Equivalent tools: SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE with the same quote_id."
+            "Then ask them to accept or reject. "
+            "**Prefer** tool **SALESFORCE_UPDATE_SOBJECT** (usually listed first): "
+            f"arguments `sobject_type`: \"Quote\", `record_id`: \"{quote_id}\", `fields`: "
+            f"{json.dumps(accept_patch)} for accept, or `fields`: {json.dumps(reject_patch)} for reject. "
+            "If those tools appear in tools/list, you may instead use **SALESFORCE_SET_QUOTE_STATUS** "
+            "(decision accept/reject) or SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE."
         )
         result["next_tools"] = {
             "on_user_accept": {
-                "tool": "SALESFORCE_SET_QUOTE_STATUS",
-                "arguments": {"quote_id": quote_id, "decision": "accept"},
+                "tool": "SALESFORCE_UPDATE_SOBJECT",
+                "arguments": {
+                    "sobject_type": "Quote",
+                    "record_id": quote_id,
+                    "fields": accept_patch,
+                },
             },
             "on_user_reject": {
-                "tool": "SALESFORCE_SET_QUOTE_STATUS",
-                "arguments": {"quote_id": quote_id, "decision": "reject"},
+                "tool": "SALESFORCE_UPDATE_SOBJECT",
+                "arguments": {
+                    "sobject_type": "Quote",
+                    "record_id": quote_id,
+                    "fields": reject_patch,
+                },
             },
-            "aliases": {
-                "accept_tool": "SALESFORCE_ACCEPT_QUOTE",
-                "reject_tool": "SALESFORCE_REJECT_QUOTE",
+            "optional_quote_specific_tools": {
+                "set_status": "SALESFORCE_SET_QUOTE_STATUS",
+                "accept": "SALESFORCE_ACCEPT_QUOTE",
+                "reject": "SALESFORCE_REJECT_QUOTE",
             },
         }
         result["mcp_tool_names_for_quote_status"] = [
+            "SALESFORCE_UPDATE_SOBJECT",
             "SALESFORCE_SET_QUOTE_STATUS",
             "SALESFORCE_ACCEPT_QUOTE",
             "SALESFORCE_REJECT_QUOTE",
