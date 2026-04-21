@@ -45,10 +45,35 @@ def _opportunity_summary_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> 
             "opportunity_id": quote_row.get("OpportunityId"),
             "opportunity_name": None,
         }
+    # Ignore relationship "attributes" wrapper; Name/Id live on the same dict.
+    name = opp.get("Name")
+    oid = opp.get("Id") or quote_row.get("OpportunityId")
     return {
-        "opportunity_id": opp.get("Id") or quote_row.get("OpportunityId"),
-        "opportunity_name": opp.get("Name"),
+        "opportunity_id": oid,
+        "opportunity_name": name,
     }
+
+
+def _enrich_opportunity_summary(sf: Any, summary: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If Name is missing (some clients/API paths omit nested Opportunity on Quote), load Opportunity by Id.
+    """
+    out = dict(summary or {})
+    oid = out.get("opportunity_id")
+    if not oid or str(oid).strip() == "":
+        return out
+    if out.get("opportunity_name") is not None and str(out.get("opportunity_name")).strip() != "":
+        return out
+    try:
+        esc = _soql_escape(str(oid).strip())
+        r2 = sf.query(f"SELECT Id, Name FROM Opportunity WHERE Id = '{esc}' LIMIT 1")
+        recs = r2.get("records") or []
+        if recs:
+            out["opportunity_id"] = recs[0].get("Id") or oid
+            out["opportunity_name"] = recs[0].get("Name")
+    except Exception as ex:
+        print(f"[Quote] Opportunity lookup fallback failed: {ex}", file=sys.stderr)
+    return out
 
 
 def _opportunity_account_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -339,14 +364,20 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
         snap = _fetch_quote_snapshot(sf, qid)
         oa = snap.get("opportunity_account") or {}
         sku_rows = snap.get("quote_line_product_skus") or []
+        oid = snap.get("opportunity_id")
+        oname = snap.get("opportunity_name")
         print(f"[Quote] Updated Quote {qid} Status={status}", file=sys.stderr)
         out: Dict[str, Any] = {
             "success": True,
             "quote_id": qid,
             "status": status,
             "quote": snap.get("quote"),
-            "opportunity_id": snap.get("opportunity_id"),
-            "opportunity_name": snap.get("opportunity_name"),
+            "opportunity_id": oid,
+            "opportunity_name": oname,
+            "OpportunityId": oid,
+            "OpportunityName": oname,
+            "opportunity": snap.get("opportunity") or {"id": oid, "name": oname},
+            "ui_opportunity_header": snap.get("ui_opportunity_header"),
             "quote_line_details": snap.get("quote_line_details"),
             "quote_line_details_count": snap.get("quote_line_details_count"),
             "quote_line_product_skus": sku_rows,
@@ -360,6 +391,12 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
         }
         if str(status).strip() == str(QUOTE_STATUS_ACCEPTED).strip():
             out["product_skus_on_accept"] = sku_rows
+            out["ui_quote_acceptance_header"] = (
+                f"{snap.get('ui_opportunity_header') or ''}\n"
+                f"Account: {oa.get('account_name') or '(n/a)'}  |  Account Id: {oa.get('account_id') or '(n/a)'}\n"
+                f"Quote: {snap.get('quote', {}).get('Name') if isinstance(snap.get('quote'), dict) else ''}  |  "
+                f"Quote Id: {qid}  |  Status: {status}"
+            ).strip()
         return out
     except Exception as e:
         err = str(e)
@@ -413,7 +450,12 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
         )
 
     oa = _opportunity_account_from_quote_row(quote_row)
-    osum = _opportunity_summary_from_quote_row(quote_row)
+    osum = _enrich_opportunity_summary(sf, _opportunity_summary_from_quote_row(quote_row))
+    oid = osum.get("opportunity_id")
+    oname = osum.get("opportunity_name")
+    ui_opp = ""
+    if oid or oname:
+        ui_opp = f"Opportunity: {oname or '(name unavailable)'}  |  Opportunity Id: {oid or '(id unavailable)'}"
     return {
         "quote": quote_row,
         "quote_line_details": line_details,
@@ -421,8 +463,12 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
         "quote_line_product_skus": _quote_line_product_sku_rows(line_details),
         "ui_formatted_quote_lines": _format_quote_lines_for_ui(line_details),
         "opportunity_account": oa,
-        "opportunity_id": osum.get("opportunity_id"),
-        "opportunity_name": osum.get("opportunity_name"),
+        "opportunity_id": oid,
+        "opportunity_name": oname,
+        "OpportunityId": oid,
+        "OpportunityName": oname,
+        "opportunity": {"id": oid, "name": oname},
+        "ui_opportunity_header": ui_opp or None,
     }
 
 
@@ -552,10 +598,12 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
             result["quote_line_details"]
         )
         result["quote_line_product_skus"] = snap.get("quote_line_product_skus") or []
-        if snap.get("opportunity_id"):
-            result["opportunity_id"] = snap.get("opportunity_id")
-        if snap.get("opportunity_name") is not None:
-            result["opportunity_name"] = snap.get("opportunity_name")
+        result["opportunity_id"] = snap.get("opportunity_id")
+        result["opportunity_name"] = snap.get("opportunity_name")
+        result["OpportunityId"] = snap.get("OpportunityId")
+        result["OpportunityName"] = snap.get("OpportunityName")
+        result["opportunity"] = snap.get("opportunity")
+        result["ui_opportunity_header"] = snap.get("ui_opportunity_header")
         oa_snap = snap.get("opportunity_account") or {}
         result["opportunity_account"] = oa_snap
         for src, dst in (
