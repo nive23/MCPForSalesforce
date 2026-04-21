@@ -7,7 +7,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from simple_salesforce import SFType
 
@@ -18,6 +18,39 @@ QUOTE_STATUS_ACCEPTED = os.getenv("SF_QUOTE_STATUS_ACCEPTED", "Accepted").strip(
 QUOTE_STATUS_REJECTED = os.getenv("SF_QUOTE_STATUS_REJECTED", "Rejected").strip() or "Rejected"
 # Optional extra Product2 field in SOQL for org-specific SKU (e.g. SKU__c). Must be API-safe.
 _PRODUCT_SKU_CUSTOM_FIELD = os.getenv("SF_PRODUCT_SKU_CUSTOM_FIELD", "").strip()
+# Comma-separated Product2 API names, first populated wins (before heuristic fallback). Example:
+# SF_PRODUCT_SKU_FIELDS=SKU_Id__c,StockKeepingUnit,ProductCode
+_SF_PRODUCT_SKU_FIELDS_RAW = os.getenv("SF_PRODUCT_SKU_FIELDS", "").strip()
+_API_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _parse_env_csv_api_names(raw: str) -> List[str]:
+    out: List[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if name and _API_NAME_RE.match(name):
+            out.append(name)
+    return out
+
+
+def _product2_sku_field_names() -> List[str]:
+    """Product2 fields to SELECT for SKU (deduped, stable order)."""
+    seen: set = set()
+    out: List[str] = []
+    for name in _parse_env_csv_api_names(_SF_PRODUCT_SKU_FIELDS_RAW):
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    if _PRODUCT_SKU_CUSTOM_FIELD and _API_NAME_RE.match(_PRODUCT_SKU_CUSTOM_FIELD):
+        c = _PRODUCT_SKU_CUSTOM_FIELD
+        if c not in seen:
+            out.insert(0, c)
+            seen.add(c)
+    for d in ("StockKeepingUnit", "ProductCode"):
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
 
 
 def _soql_escape(s: str) -> str:
@@ -76,6 +109,41 @@ def _enrich_opportunity_summary(sf: Any, summary: Dict[str, Any]) -> Dict[str, A
     return out
 
 
+def _enrich_account_summary(sf: Any, quote_row: Optional[Dict[str, Any]], oa: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If Account.Name is missing on the nested relationship, load Account by Id (Opportunity.AccountId or oa).
+    """
+    out = dict(oa or {})
+    aid = out.get("account_id")
+    if not aid or str(aid).strip() == "":
+        if isinstance(quote_row, dict):
+            opp = quote_row.get("Opportunity")
+            if isinstance(opp, dict):
+                aid = opp.get("AccountId") or aid
+                out["account_id"] = aid
+    if not aid or str(aid).strip() == "":
+        return out
+    if out.get("account_name") is not None and str(out.get("account_name")).strip() != "":
+        return out
+    try:
+        esc = _soql_escape(str(aid).strip())
+        r2 = sf.query(
+            f"SELECT Id, Name, Phone, Industry FROM Account WHERE Id = '{esc}' LIMIT 1"
+        )
+        recs = r2.get("records") or []
+        if recs:
+            a = recs[0]
+            out["account_id"] = a.get("Id") or aid
+            out["account_name"] = a.get("Name")
+            if out.get("account_phone") is None:
+                out["account_phone"] = a.get("Phone")
+            if out.get("account_industry") is None:
+                out["account_industry"] = a.get("Industry")
+    except Exception as ex:
+        print(f"[Quote] Account lookup fallback failed: {ex}", file=sys.stderr)
+    return out
+
+
 def _opportunity_account_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Account on the Quote's Opportunity (Id, Name, Phone, Industry)."""
     empty = {
@@ -106,29 +174,52 @@ def _opportunity_account_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> 
 
 
 def _product2_sku_select_fragment() -> str:
-    base = (
-        "PricebookEntry.Product2.Id, PricebookEntry.Product2.Name, "
-        "PricebookEntry.Product2.ProductCode, PricebookEntry.Product2.StockKeepingUnit"
-    )
-    f = _PRODUCT_SKU_CUSTOM_FIELD
-    if f and re.match(r"^[A-Za-z0-9_]+$", f):
-        return f"{base}, PricebookEntry.Product2.{f}"
-    return base
+    parts = ["PricebookEntry.Product2.Id", "PricebookEntry.Product2.Name"]
+    for f in _product2_sku_field_names():
+        parts.append(f"PricebookEntry.Product2.{f}")
+    return ", ".join(parts)
 
 
-def _resolved_product_sku(p2: Dict[str, Any]) -> Optional[str]:
-    """Single SKU string for UI: custom field > StockKeepingUnit > ProductCode."""
+def _collect_product2_sku_candidates(p2: Dict[str, Any]) -> Dict[str, str]:
     if not isinstance(p2, dict):
-        return None
-    if _PRODUCT_SKU_CUSTOM_FIELD and _PRODUCT_SKU_CUSTOM_FIELD in p2:
-        v = p2.get(_PRODUCT_SKU_CUSTOM_FIELD)
+        return {}
+    out: Dict[str, str] = {}
+    for fname in _product2_sku_field_names():
+        v = p2.get(fname)
         if v is not None and str(v).strip():
-            return str(v).strip()
-    for k in ("StockKeepingUnit", "ProductCode"):
-        v = p2.get(k)
-        if v is not None and str(v).strip():
-            return str(v).strip()
-    return None
+            out[fname] = str(v).strip()
+    return out
+
+
+def _pick_sku_from_candidates(candidates: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (sku_value, source_field_api_name).
+    If SF_PRODUCT_SKU_FIELDS is set: first listed field with a value wins.
+    Otherwise: legacy custom field if present, else prefer values containing 'sku-',
+    else the longest string (full org SKUs often longer than short ProductCode).
+    """
+    if not candidates:
+        return None, None
+    explicit = _parse_env_csv_api_names(_SF_PRODUCT_SKU_FIELDS_RAW)
+    for fname in explicit:
+        if fname in candidates:
+            return candidates[fname], fname
+    lf = _PRODUCT_SKU_CUSTOM_FIELD
+    if lf and lf in candidates:
+        return candidates[lf], lf
+    items = list(candidates.items())
+    for fname, val in items:
+        if "sku-" in val.lower():
+            return val, fname
+    fname, val = max(items, key=lambda kv: len(kv[1]))
+    return val, fname
+
+
+def _resolved_product_sku_bundle(p2: Dict[str, Any]) -> Dict[str, Any]:
+    """sku + which Product2 field won + all non-empty candidate values for debugging."""
+    cand = _collect_product2_sku_candidates(p2)
+    sku, src = _pick_sku_from_candidates(cand)
+    return {"sku": sku, "sku_source_field": src, "sku_candidates": cand}
 
 
 def _quote_line_product_sku_rows(line_details: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -143,9 +234,60 @@ def _quote_line_product_sku_rows(line_details: List[Dict[str, Any]]) -> List[Dic
                 "product_code": row.get("ProductCode"),
                 "stock_keeping_unit": row.get("StockKeepingUnit"),
                 "sku": row.get("sku"),
+                "sku_source_field": row.get("sku_source_field"),
+                "sku_candidates": row.get("sku_candidates"),
             }
         )
     return out
+
+
+def _apex_sku_id_from_line(line: Dict[str, Any]) -> Optional[str]:
+    """Match Apex QuoteLineResponse.skuId (Product2.SKU__c) when that field is queried."""
+    cand = line.get("sku_candidates") if isinstance(line.get("sku_candidates"), dict) else {}
+    if cand.get("SKU__c") is not None and str(cand["SKU__c"]).strip():
+        return str(cand["SKU__c"]).strip()
+    v = line.get("sku")
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    return None
+
+
+def _apex_quote_line_response(line: Dict[str, Any]) -> Dict[str, Any]:
+    """One row matching Apex QuoteLineResponse (InvocableVariable names)."""
+    return {
+        "skuId": _apex_sku_id_from_line(line),
+        "listPrice": line.get("ListPrice"),
+        "salesPrice": line.get("UnitPrice"),
+        "quantity": line.get("Quantity"),
+    }
+
+
+def _apex_quote_result_payload(
+    quote_id: str,
+    snap: Dict[str, Any],
+    *,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Payload aligned with Apex CreateQuoteFromOpportunity.QuoteResult / QuoteLineResponse.
+    On success, errorMessage is None. Include Product2.SKU__c in SOQL via SF_PRODUCT_SKU_FIELDS
+    or SF_PRODUCT_SKU_CUSTOM_FIELD=SKU__c so skuId matches Apex.
+    """
+    oa = snap.get("opportunity_account") if isinstance(snap.get("opportunity_account"), dict) else {}
+    details = snap.get("quote_line_details") if isinstance(snap.get("quote_line_details"), list) else []
+    quote_lines = [_apex_quote_line_response(row) for row in details if isinstance(row, dict)]
+    return {
+        "quoteId": quote_id,
+        "opportunityId": snap.get("opportunity_id"),
+        "opportunityName": snap.get("opportunity_name"),
+        "accountId": oa.get("account_id"),
+        "accountName": oa.get("account_name"),
+        "accountPhone": oa.get("account_phone"),
+        "accountIndustry": oa.get("account_industry"),
+        "quoteLineCount": len(quote_lines),
+        "quoteLines": quote_lines,
+        "errorMessage": error_message,
+    }
 
 
 def _format_quote_lines_for_ui(line_details: List[Dict[str, Any]]) -> str:
@@ -181,7 +323,12 @@ def get_quote_tools() -> List[Dict[str, Any]]:
             "description": (
                 "**Use this after the user accepts or rejects a quote.** Sets Quote.Status. "
                 "Arguments: quote_id (or quoteId), decision = 'accept' or 'reject' (also accepted: "
-                "approved / rejected). Same as SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE."
+                "approved / rejected). Same as SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE. "
+                "On **accept**, the response includes **quoteResult** (Apex-aligned): quoteId, "
+                "opportunityId, opportunityName, accountId, accountName, accountPhone, accountIndustry, "
+                "quoteLineCount, quoteLines[{skuId, listPrice, salesPrice, quantity}], errorMessage. "
+                "Set env SF_PRODUCT_SKU_FIELDS=SKU__c (or SF_PRODUCT_SKU_CUSTOM_FIELD=SKU__c) if skuId "
+                "must match Product2.SKU__c."
             ),
             "inputSchema": {
                 "type": "object",
@@ -241,7 +388,8 @@ def get_quote_tools() -> List[Dict[str, Any]]:
             "name": "SALESFORCE_ACCEPT_QUOTE",
             "description": (
                 f"Set Quote.Status to accepted value (default '{QUOTE_STATUS_ACCEPTED}') after the user "
-                "approves the quote in the UI."
+                "approves the quote in the UI. Response includes **quoteResult** (same shape as Apex "
+                "CreateQuoteFromOpportunity.QuoteResult / QuoteLineResponse)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -383,6 +531,10 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
             "quote_line_product_skus": sku_rows,
             "ui_formatted_quote_lines": snap.get("ui_formatted_quote_lines"),
             "opportunity_account": oa,
+            "account": snap.get("account") or {"id": oa.get("account_id"), "name": oa.get("account_name")},
+            "AccountId": snap.get("AccountId") or oa.get("account_id"),
+            "AccountName": snap.get("AccountName") or oa.get("account_name"),
+            "ui_account_header": snap.get("ui_account_header"),
             "accountId": oa.get("account_id"),
             "accountName": oa.get("account_name"),
             "accountPhone": oa.get("account_phone"),
@@ -391,11 +543,17 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
         }
         if str(status).strip() == str(QUOTE_STATUS_ACCEPTED).strip():
             out["product_skus_on_accept"] = sku_rows
+            out["quoteResult"] = _apex_quote_result_payload(qid, snap, error_message=None)
+            acc_line = snap.get("ui_account_header") or (
+                f"Account: {oa.get('account_name') or '(n/a)'}  |  Account Id: {oa.get('account_id') or '(n/a)'}"
+            )
             out["ui_quote_acceptance_header"] = (
+                f"{acc_line}\n"
                 f"{snap.get('ui_opportunity_header') or ''}\n"
-                f"Account: {oa.get('account_name') or '(n/a)'}  |  Account Id: {oa.get('account_id') or '(n/a)'}\n"
                 f"Quote: {snap.get('quote', {}).get('Name') if isinstance(snap.get('quote'), dict) else ''}  |  "
-                f"Quote Id: {qid}  |  Status: {status}"
+                f"Quote Id: {qid}  |  Quote Number: "
+                f"{(snap.get('quote') or {}).get('QuoteNumber') if isinstance(snap.get('quote'), dict) else ''}  |  "
+                f"Status: {status}"
             ).strip()
         return out
     except Exception as e:
@@ -429,7 +587,7 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
     for row in lines:
         pbe = row.get("PricebookEntry") or {}
         p2 = pbe.get("Product2") if isinstance(pbe.get("Product2"), dict) else {}
-        sku_val = _resolved_product_sku(p2) if isinstance(p2, dict) else None
+        sku_bundle = _resolved_product_sku_bundle(p2) if isinstance(p2, dict) else {}
         line_details.append(
             {
                 "Id": row.get("Id"),
@@ -445,17 +603,24 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
                 "ProductName": p2.get("Name") if isinstance(p2, dict) else None,
                 "ProductCode": p2.get("ProductCode") if isinstance(p2, dict) else None,
                 "StockKeepingUnit": p2.get("StockKeepingUnit") if isinstance(p2, dict) else None,
-                "sku": sku_val,
+                "sku": sku_bundle.get("sku"),
+                "sku_source_field": sku_bundle.get("sku_source_field"),
+                "sku_candidates": sku_bundle.get("sku_candidates"),
             }
         )
 
-    oa = _opportunity_account_from_quote_row(quote_row)
+    oa = _enrich_account_summary(sf, quote_row, _opportunity_account_from_quote_row(quote_row))
     osum = _enrich_opportunity_summary(sf, _opportunity_summary_from_quote_row(quote_row))
     oid = osum.get("opportunity_id")
     oname = osum.get("opportunity_name")
     ui_opp = ""
     if oid or oname:
         ui_opp = f"Opportunity: {oname or '(name unavailable)'}  |  Opportunity Id: {oid or '(id unavailable)'}"
+    acc_id = oa.get("account_id")
+    acc_name = oa.get("account_name")
+    ui_acc = ""
+    if acc_id or acc_name:
+        ui_acc = f"Account: {acc_name or '(name unavailable)'}  |  Account Id: {acc_id or '(id unavailable)'}"
     return {
         "quote": quote_row,
         "quote_line_details": line_details,
@@ -463,6 +628,10 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
         "quote_line_product_skus": _quote_line_product_sku_rows(line_details),
         "ui_formatted_quote_lines": _format_quote_lines_for_ui(line_details),
         "opportunity_account": oa,
+        "account": {"id": acc_id, "name": acc_name},
+        "AccountId": acc_id,
+        "AccountName": acc_name,
+        "ui_account_header": ui_acc or None,
         "opportunity_id": oid,
         "opportunity_name": oname,
         "OpportunityId": oid,
@@ -604,6 +773,10 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
         result["OpportunityName"] = snap.get("OpportunityName")
         result["opportunity"] = snap.get("opportunity")
         result["ui_opportunity_header"] = snap.get("ui_opportunity_header")
+        result["account"] = snap.get("account")
+        result["AccountId"] = snap.get("AccountId")
+        result["AccountName"] = snap.get("AccountName")
+        result["ui_account_header"] = snap.get("ui_account_header")
         oa_snap = snap.get("opportunity_account") or {}
         result["opportunity_account"] = oa_snap
         for src, dst in (
