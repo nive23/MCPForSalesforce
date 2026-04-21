@@ -5,6 +5,7 @@ and accept/reject status updates.
 """
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,8 @@ from salesforce_config import get_salesforce
 # Picklist values for Quote.Status (override if your org uses different API values)
 QUOTE_STATUS_ACCEPTED = os.getenv("SF_QUOTE_STATUS_ACCEPTED", "Accepted").strip() or "Accepted"
 QUOTE_STATUS_REJECTED = os.getenv("SF_QUOTE_STATUS_REJECTED", "Rejected").strip() or "Rejected"
+# Optional extra Product2 field in SOQL for org-specific SKU (e.g. SKU__c). Must be API-safe.
+_PRODUCT_SKU_CUSTOM_FIELD = os.getenv("SF_PRODUCT_SKU_CUSTOM_FIELD", "").strip()
 
 
 def _soql_escape(s: str) -> str:
@@ -29,6 +32,23 @@ def _soql_query_all_records(sf: Any, soql: str) -> List[Dict[str, Any]]:
         return list(out.get("records") or [])
     out = sf.query(soql)
     return list(out.get("records") or [])
+
+
+def _opportunity_summary_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Opportunity Id + Name from the Quote's Opportunity lookup."""
+    empty = {"opportunity_id": None, "opportunity_name": None}
+    if not quote_row or not isinstance(quote_row, dict):
+        return dict(empty)
+    opp = quote_row.get("Opportunity")
+    if not isinstance(opp, dict):
+        return {
+            "opportunity_id": quote_row.get("OpportunityId"),
+            "opportunity_name": None,
+        }
+    return {
+        "opportunity_id": opp.get("Id") or quote_row.get("OpportunityId"),
+        "opportunity_name": opp.get("Name"),
+    }
 
 
 def _opportunity_account_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -60,13 +80,56 @@ def _opportunity_account_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> 
     }
 
 
+def _product2_sku_select_fragment() -> str:
+    base = (
+        "PricebookEntry.Product2.Id, PricebookEntry.Product2.Name, "
+        "PricebookEntry.Product2.ProductCode, PricebookEntry.Product2.StockKeepingUnit"
+    )
+    f = _PRODUCT_SKU_CUSTOM_FIELD
+    if f and re.match(r"^[A-Za-z0-9_]+$", f):
+        return f"{base}, PricebookEntry.Product2.{f}"
+    return base
+
+
+def _resolved_product_sku(p2: Dict[str, Any]) -> Optional[str]:
+    """Single SKU string for UI: custom field > StockKeepingUnit > ProductCode."""
+    if not isinstance(p2, dict):
+        return None
+    if _PRODUCT_SKU_CUSTOM_FIELD and _PRODUCT_SKU_CUSTOM_FIELD in p2:
+        v = p2.get(_PRODUCT_SKU_CUSTOM_FIELD)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    for k in ("StockKeepingUnit", "ProductCode"):
+        v = p2.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _quote_line_product_sku_rows(line_details: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compact list of product2 Id + SKU per quote line (sent on create and on status update)."""
+    out: List[Dict[str, Any]] = []
+    for row in line_details:
+        out.append(
+            {
+                "quote_line_item_id": row.get("Id"),
+                "product2_id": row.get("Product2Id"),
+                "product_name": row.get("ProductName"),
+                "product_code": row.get("ProductCode"),
+                "stock_keeping_unit": row.get("StockKeepingUnit"),
+                "sku": row.get("sku"),
+            }
+        )
+    return out
+
+
 def _format_quote_lines_for_ui(line_details: List[Dict[str, Any]]) -> str:
     """Plain-text table of every quote line for UI / Claude (no omitted rows)."""
     if not line_details:
         return "(No quote line items)"
     lines_out = [
-        "Line# | Product | Qty | Unit price | Subtotal | Total",
-        "------|---------|-----|-------------|----------|------",
+        "Line# | Product | Product2 Id | SKU | Qty | Unit price | Subtotal | Total",
+        "------|---------|---------------|-----|-----|-------------|----------|------",
     ]
     for row in line_details:
         ln = row.get("LineNumber")
@@ -74,8 +137,12 @@ def _format_quote_lines_for_ui(line_details: List[Dict[str, Any]]) -> str:
             ln = "-"
         name = row.get("ProductName") or row.get("Description") or "(no name)"
         name = str(name).replace("|", "/")
+        pid = row.get("Product2Id") or "-"
+        sku = row.get("sku") or row.get("StockKeepingUnit") or row.get("ProductCode") or "-"
+        sku = str(sku).replace("|", "/")
+        pid = str(pid).replace("|", "/")
         lines_out.append(
-            f"{ln} | {name} | {row.get('Quantity')} | {row.get('UnitPrice')} | "
+            f"{ln} | {name} | {pid} | {sku} | {row.get('Quantity')} | {row.get('UnitPrice')} | "
             f"{row.get('Subtotal')} | {row.get('TotalPrice')}"
         )
     return "\n".join(lines_out)
@@ -271,14 +338,18 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
 
         snap = _fetch_quote_snapshot(sf, qid)
         oa = snap.get("opportunity_account") or {}
+        sku_rows = snap.get("quote_line_product_skus") or []
         print(f"[Quote] Updated Quote {qid} Status={status}", file=sys.stderr)
-        return {
+        out: Dict[str, Any] = {
             "success": True,
             "quote_id": qid,
             "status": status,
             "quote": snap.get("quote"),
+            "opportunity_id": snap.get("opportunity_id"),
+            "opportunity_name": snap.get("opportunity_name"),
             "quote_line_details": snap.get("quote_line_details"),
             "quote_line_details_count": snap.get("quote_line_details_count"),
+            "quote_line_product_skus": sku_rows,
             "ui_formatted_quote_lines": snap.get("ui_formatted_quote_lines"),
             "opportunity_account": oa,
             "accountId": oa.get("account_id"),
@@ -287,6 +358,9 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
             "accountIndustry": oa.get("account_industry"),
             "message": f"Quote status set to {status}.",
         }
+        if str(status).strip() == str(QUOTE_STATUS_ACCEPTED).strip():
+            out["product_skus_on_accept"] = sku_rows
+        return out
     except Exception as e:
         err = str(e)
         print(f"[Quote ERROR] set_quote_status: {err}", file=sys.stderr)
@@ -297,7 +371,8 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
     esc = _soql_escape(quote_id)
     q_quote = (
         "SELECT Id, Name, Status, QuoteNumber, TotalPrice, Subtotal, ExpirationDate, "
-        "OpportunityId, Opportunity.AccountId, Opportunity.Account.Name, Opportunity.Account.Phone, "
+        "OpportunityId, Opportunity.Id, Opportunity.Name, "
+        "Opportunity.AccountId, Opportunity.Account.Name, Opportunity.Account.Phone, "
         "Opportunity.Account.Industry, Pricebook2Id, CreatedDate, LastModifiedDate "
         f"FROM Quote WHERE Id = '{esc}' LIMIT 1"
     )
@@ -305,9 +380,10 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
     qrecs = qr.get("records") or []
     quote_row = qrecs[0] if qrecs else None
 
+    p2_fields = _product2_sku_select_fragment()
     q_li = (
         "SELECT Id, LineNumber, Quantity, UnitPrice, ListPrice, Subtotal, Discount, TotalPrice, "
-        "Description, PricebookEntry.Product2.Name, PricebookEntry.Product2.ProductCode "
+        f"Description, {p2_fields} "
         f"FROM QuoteLineItem WHERE QuoteId = '{esc}' ORDER BY LineNumber, CreatedDate"
     )
     lines = _soql_query_all_records(sf, q_li)
@@ -316,6 +392,7 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
     for row in lines:
         pbe = row.get("PricebookEntry") or {}
         p2 = pbe.get("Product2") if isinstance(pbe.get("Product2"), dict) else {}
+        sku_val = _resolved_product_sku(p2) if isinstance(p2, dict) else None
         line_details.append(
             {
                 "Id": row.get("Id"),
@@ -327,18 +404,25 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
                 "Discount": row.get("Discount"),
                 "TotalPrice": row.get("TotalPrice"),
                 "Description": row.get("Description"),
+                "Product2Id": p2.get("Id") if isinstance(p2, dict) else None,
                 "ProductName": p2.get("Name") if isinstance(p2, dict) else None,
                 "ProductCode": p2.get("ProductCode") if isinstance(p2, dict) else None,
+                "StockKeepingUnit": p2.get("StockKeepingUnit") if isinstance(p2, dict) else None,
+                "sku": sku_val,
             }
         )
 
     oa = _opportunity_account_from_quote_row(quote_row)
+    osum = _opportunity_summary_from_quote_row(quote_row)
     return {
         "quote": quote_row,
         "quote_line_details": line_details,
         "quote_line_details_count": len(line_details),
+        "quote_line_product_skus": _quote_line_product_sku_rows(line_details),
         "ui_formatted_quote_lines": _format_quote_lines_for_ui(line_details),
         "opportunity_account": oa,
+        "opportunity_id": osum.get("opportunity_id"),
+        "opportunity_name": osum.get("opportunity_name"),
     }
 
 
@@ -361,6 +445,7 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
         "quote": None,
         "quote_line_details": [],
         "quote_line_details_count": 0,
+        "quote_line_product_skus": [],
         "ui_formatted_quote_lines": None,
         "opportunity_account": None,
         "ui_prompt_for_user": None,
@@ -466,6 +551,11 @@ def create_quote_logic(sf: Any, opportunity_id: str) -> Dict[str, Any]:
         result["ui_formatted_quote_lines"] = snap.get("ui_formatted_quote_lines") or _format_quote_lines_for_ui(
             result["quote_line_details"]
         )
+        result["quote_line_product_skus"] = snap.get("quote_line_product_skus") or []
+        if snap.get("opportunity_id"):
+            result["opportunity_id"] = snap.get("opportunity_id")
+        if snap.get("opportunity_name") is not None:
+            result["opportunity_name"] = snap.get("opportunity_name")
         oa_snap = snap.get("opportunity_account") or {}
         result["opportunity_account"] = oa_snap
         for src, dst in (
