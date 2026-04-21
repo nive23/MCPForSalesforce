@@ -22,6 +22,11 @@ _PRODUCT_SKU_CUSTOM_FIELD = os.getenv("SF_PRODUCT_SKU_CUSTOM_FIELD", "").strip()
 # SF_PRODUCT_SKU_FIELDS=SKU_Id__c,StockKeepingUnit,ProductCode
 _SF_PRODUCT_SKU_FIELDS_RAW = os.getenv("SF_PRODUCT_SKU_FIELDS", "").strip()
 _API_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+# When true (default), QuoteLineItem SOQL tries Product2.SKU__c and retries without it if the org has no field.
+_AUTO_PROBE_PRODUCT2_SKU__C = (
+    os.getenv("SF_DISABLE_AUTO_SKU__C", "").strip().lower() not in ("1", "true", "yes")
+)
+_DEFAULT_PROBE_SKU_FIELD = "SKU__c"
 
 
 def _parse_env_csv_api_names(raw: str) -> List[str]:
@@ -53,8 +58,100 @@ def _product2_sku_field_names() -> List[str]:
     return out
 
 
+def _product2_sku_names_for_query(probe_sku_c: bool) -> List[str]:
+    """Field API names on Product2 to SELECT; optionally prepend SKU__c for orgs that define it."""
+    names = list(_product2_sku_field_names())
+    if probe_sku_c and _DEFAULT_PROBE_SKU_FIELD not in names:
+        names.insert(0, _DEFAULT_PROBE_SKU_FIELD)
+    return names
+
+
+def _product2_sku_select_fragment_from_names(field_names: List[str]) -> str:
+    parts = ["PricebookEntry.Product2.Id", "PricebookEntry.Product2.Name"]
+    for f in field_names:
+        parts.append(f"PricebookEntry.Product2.{f}")
+    return ", ".join(parts)
+
+
+def _soql_error_suggests_missing_sku_c(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if "sku__c" not in msg:
+        return False
+    return any(
+        t in msg
+        for t in (
+            "invalid_field",
+            "invalid field",
+            "no such column",
+            "unknown_field",
+            "could not resolve",
+            "malformed_query",
+        )
+    )
+
+
 def _soql_escape(s: str) -> str:
     return str(s).replace("'", "''")
+
+
+def _is_salesforce_id(s: str) -> bool:
+    """True for typical 15- or 18-character Salesforce record ids."""
+    if not s or len(s) not in (15, 18):
+        return False
+    return bool(re.match(r"^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$", s))
+
+
+def _empty_snap_for_apex() -> Dict[str, Any]:
+    return {
+        "opportunity_id": None,
+        "opportunity_name": None,
+        "opportunity_account": {},
+        "quote_line_details": [],
+    }
+
+
+def _quote_id_for_opportunity(sf: Any, opportunity_id: str) -> Optional[str]:
+    """Most recently modified Quote on this Opportunity (common when user passes Opp Id by mistake)."""
+    esc = _soql_escape(opportunity_id)
+    soql = (
+        f"SELECT Id FROM Quote WHERE OpportunityId = '{esc}' "
+        "ORDER BY LastModifiedDate DESC LIMIT 1"
+    )
+    rows = _soql_query_all_records(sf, soql)
+    if not rows:
+        return None
+    rid = rows[0].get("Id")
+    return str(rid).strip() if rid else None
+
+
+def _fetch_opportunity_minimal_for_apex(sf: Any, opportunity_id: str) -> Dict[str, Any]:
+    """Opportunity + Account fields for quoteResult when no Quote exists (or for error context)."""
+    esc = _soql_escape(opportunity_id)
+    q = (
+        "SELECT Id, Name, AccountId, Account.Name, Account.Phone, Account.Industry "
+        f"FROM Opportunity WHERE Id = '{esc}' LIMIT 1"
+    )
+    try:
+        qr = sf.query(q)
+    except Exception:
+        return _empty_snap_for_apex()
+    recs = qr.get("records") or []
+    if not recs:
+        return _empty_snap_for_apex()
+    opp = recs[0]
+    acc = opp.get("Account") if isinstance(opp.get("Account"), dict) else {}
+    oa = {
+        "account_id": opp.get("AccountId") or acc.get("Id"),
+        "account_name": acc.get("Name"),
+        "account_phone": acc.get("Phone"),
+        "account_industry": acc.get("Industry"),
+    }
+    return {
+        "opportunity_id": opp.get("Id"),
+        "opportunity_name": opp.get("Name"),
+        "opportunity_account": oa,
+        "quote_line_details": [],
+    }
 
 
 def _soql_query_all_records(sf: Any, soql: str) -> List[Dict[str, Any]]:
@@ -173,18 +270,15 @@ def _opportunity_account_from_quote_row(quote_row: Optional[Dict[str, Any]]) -> 
     }
 
 
-def _product2_sku_select_fragment() -> str:
-    parts = ["PricebookEntry.Product2.Id", "PricebookEntry.Product2.Name"]
-    for f in _product2_sku_field_names():
-        parts.append(f"PricebookEntry.Product2.{f}")
-    return ", ".join(parts)
-
-
-def _collect_product2_sku_candidates(p2: Dict[str, Any]) -> Dict[str, str]:
+def _collect_product2_sku_candidates(
+    p2: Dict[str, Any],
+    field_names: Optional[List[str]] = None,
+) -> Dict[str, str]:
     if not isinstance(p2, dict):
         return {}
+    names = field_names if field_names is not None else _product2_sku_field_names()
     out: Dict[str, str] = {}
-    for fname in _product2_sku_field_names():
+    for fname in names:
         v = p2.get(fname)
         if v is not None and str(v).strip():
             out[fname] = str(v).strip()
@@ -207,6 +301,9 @@ def _pick_sku_from_candidates(candidates: Dict[str, str]) -> Tuple[Optional[str]
     lf = _PRODUCT_SKU_CUSTOM_FIELD
     if lf and lf in candidates:
         return candidates[lf], lf
+    # Common org field (matches Apex Product2.SKU__c) — only used when present in SOQL/candidates.
+    if _DEFAULT_PROBE_SKU_FIELD in candidates:
+        return candidates[_DEFAULT_PROBE_SKU_FIELD], _DEFAULT_PROBE_SKU_FIELD
     items = list(candidates.items())
     for fname, val in items:
         if "sku-" in val.lower():
@@ -215,9 +312,12 @@ def _pick_sku_from_candidates(candidates: Dict[str, str]) -> Tuple[Optional[str]
     return val, fname
 
 
-def _resolved_product_sku_bundle(p2: Dict[str, Any]) -> Dict[str, Any]:
+def _resolved_product_sku_bundle(
+    p2: Dict[str, Any],
+    field_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """sku + which Product2 field won + all non-empty candidate values for debugging."""
-    cand = _collect_product2_sku_candidates(p2)
+    cand = _collect_product2_sku_candidates(p2, field_names=field_names)
     sku, src = _pick_sku_from_candidates(cand)
     return {"sku": sku, "sku_source_field": src, "sku_candidates": cand}
 
@@ -263,7 +363,7 @@ def _apex_quote_line_response(line: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apex_quote_result_payload(
-    quote_id: str,
+    quote_id: Optional[str],
     snap: Dict[str, Any],
     *,
     error_message: Optional[str] = None,
@@ -271,7 +371,7 @@ def _apex_quote_result_payload(
     """
     Payload aligned with Apex CreateQuoteFromOpportunity.QuoteResult / QuoteLineResponse.
     On success, errorMessage is None. Include Product2.SKU__c in SOQL via SF_PRODUCT_SKU_FIELDS
-    or SF_PRODUCT_SKU_CUSTOM_FIELD=SKU__c so skuId matches Apex.
+    or SF_PRODUCT_SKU_CUSTOM_FIELD. SKU__c is auto-queried when present on Product2.
     """
     oa = snap.get("opportunity_account") if isinstance(snap.get("opportunity_account"), dict) else {}
     details = snap.get("quote_line_details") if isinstance(snap.get("quote_line_details"), list) else []
@@ -322,19 +422,28 @@ def get_quote_tools() -> List[Dict[str, Any]]:
             "name": "SALESFORCE_SET_QUOTE_STATUS",
             "description": (
                 "**Use this after the user accepts or rejects a quote.** Sets Quote.Status. "
-                "Arguments: quote_id (or quoteId), decision = 'accept' or 'reject' (also accepted: "
-                "approved / rejected). Same as SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE. "
-                "On **accept**, the response includes **quoteResult** (Apex-aligned): quoteId, "
+                "Arguments: quote_id (or quoteId, or opportunity_id / opportunityId), decision = 'accept' or 'reject' "
+                "(also accepted: approved / rejected). Same as SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE. "
+                "**quote_id may be an Opportunity Id (006...)** — the server uses the most recently modified Quote "
+                "on that Opportunity. Every response includes **quoteResult** (Apex-aligned): quoteId, "
                 "opportunityId, opportunityName, accountId, accountName, accountPhone, accountIndustry, "
                 "quoteLineCount, quoteLines[{skuId, listPrice, salesPrice, quantity}], errorMessage. "
-                "Set env SF_PRODUCT_SKU_FIELDS=SKU__c (or SF_PRODUCT_SKU_CUSTOM_FIELD=SKU__c) if skuId "
-                "must match Product2.SKU__c."
+                "Product2.SKU__c is queried automatically when the field exists; set SF_DISABLE_AUTO_SKU__C=1 "
+                "if your org has no SKU__c. Other SKU API names: SF_PRODUCT_SKU_FIELDS or SF_PRODUCT_SKU_CUSTOM_FIELD."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "quote_id": {"type": "string", "description": "15 or 18 character Quote Id (0Q0...)"},
+                    "quote_id": {
+                        "type": "string",
+                        "description": "Quote Id (0Q0..., 15/18 chars) or Opportunity Id (006...); latest Quote on Opp is used",
+                    },
                     "quoteId": {"type": "string"},
+                    "opportunity_id": {
+                        "type": "string",
+                        "description": "Optional if quote_id set; otherwise same as passing 006... as quote_id",
+                    },
+                    "opportunityId": {"type": "string"},
                     "decision": {
                         "type": "string",
                         "description": "accept | reject (case-insensitive; accept also allows approve/approved)",
@@ -352,8 +461,9 @@ def get_quote_tools() -> List[Dict[str, Any]]:
             "description": (
                 "Create a standard Quote and QuoteLineItems from an Opportunity's line items. "
                 "Returns full quote and line details plus instructions for the user to accept or reject "
-                f"in the UI; then call **SALESFORCE_SET_QUOTE_STATUS** with quote_id and decision "
-                f"'accept' or 'reject' (Status → '{QUOTE_STATUS_ACCEPTED}' / '{QUOTE_STATUS_REJECTED}'). "
+                f"in the UI; then call **SALESFORCE_SET_QUOTE_STATUS** with quote_id (0Q0... or the same 006... "
+                f"Opportunity Id) and decision 'accept' or 'reject' (Status → '{QUOTE_STATUS_ACCEPTED}' / "
+                f"'{QUOTE_STATUS_REJECTED}'). "
                 "Aliases: SALESFORCE_ACCEPT_QUOTE / SALESFORCE_REJECT_QUOTE. "
                 f"Override picklist values with env SF_QUOTE_STATUS_ACCEPTED / SF_QUOTE_STATUS_REJECTED."
             ),
@@ -388,14 +498,19 @@ def get_quote_tools() -> List[Dict[str, Any]]:
             "name": "SALESFORCE_ACCEPT_QUOTE",
             "description": (
                 f"Set Quote.Status to accepted value (default '{QUOTE_STATUS_ACCEPTED}') after the user "
-                "approves the quote in the UI. Response includes **quoteResult** (same shape as Apex "
-                "CreateQuoteFromOpportunity.QuoteResult / QuoteLineResponse)."
+                "approves the quote in the UI. **quote_id** may be Quote Id (0Q0...) or Opportunity Id (006...). "
+                "Response always includes **quoteResult** (Apex CreateQuoteFromOpportunity.QuoteResult shape)."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "quote_id": {"type": "string", "description": "Quote Id from create_quote response"},
+                    "quote_id": {
+                        "type": "string",
+                        "description": "Quote Id (0Q0...) or Opportunity Id (006...); latest Quote on Opp is used",
+                    },
                     "quoteId": {"type": "string"},
+                    "opportunity_id": {"type": "string"},
+                    "opportunityId": {"type": "string"},
                 },
                 "required": [],
             },
@@ -404,13 +519,19 @@ def get_quote_tools() -> List[Dict[str, Any]]:
             "name": "SALESFORCE_REJECT_QUOTE",
             "description": (
                 f"Set Quote.Status to rejected value (default '{QUOTE_STATUS_REJECTED}') after the user "
-                "rejects the quote in the UI."
+                "rejects the quote in the UI. quote_id may be 0Q0... or 006... (latest Quote). "
+                "Response includes **quoteResult** (Apex-aligned)."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "quote_id": {"type": "string", "description": "Quote Id from create_quote response"},
+                    "quote_id": {
+                        "type": "string",
+                        "description": "Quote Id (0Q0...) or Opportunity Id (006...); latest Quote on Opp is used",
+                    },
                     "quoteId": {"type": "string"},
+                    "opportunity_id": {"type": "string"},
+                    "opportunityId": {"type": "string"},
                 },
                 "required": [],
             },
@@ -428,6 +549,10 @@ def _normalize_quote_id_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
         if v is not None and str(v).strip():
             out["quote_id"] = str(v).strip()
             break
+    if not out.get("quote_id"):
+        oid = out.get("opportunity_id") or out.get("opportunityId")
+        if oid is not None and str(oid).strip():
+            out["quote_id"] = str(oid).strip()
     return out
 
 
@@ -475,9 +600,9 @@ def set_quote_status_by_decision(sf: Any, arguments: Dict[str, Any]) -> Dict[str
     )
     d = str(raw).strip().lower()
     if d in ("accept", "accepted", "approve", "approved", "yes", "ok", "true", "1"):
-        return set_quote_status_tool(sf, arguments, QUOTE_STATUS_ACCEPTED)
+        return set_quote_status_tool(sf, _normalize_quote_id_args(arguments), QUOTE_STATUS_ACCEPTED)
     if d in ("reject", "rejected", "deny", "denied", "decline", "declined", "no", "false", "0"):
-        return set_quote_status_tool(sf, arguments, QUOTE_STATUS_REJECTED)
+        return set_quote_status_tool(sf, _normalize_quote_id_args(arguments), QUOTE_STATUS_REJECTED)
     return {
         "success": False,
         "error": (
@@ -485,27 +610,59 @@ def set_quote_status_by_decision(sf: Any, arguments: Dict[str, Any]) -> Dict[str
             f"(got {raw!r})."
         ),
         "errorMessage": "decision must be accept or reject",
+        "quoteResult": _apex_quote_result_payload(
+            None, _empty_snap_for_apex(), error_message="decision must be accept or reject"
+        ),
     }
 
 
 def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Dict[str, Any]:
     """Update Quote.Status after user accept/reject in UI."""
-    try:
-        qid = arguments.get("quote_id")
-        if not qid or not str(qid).strip():
-            return {
-                "success": False,
-                "error": "quote_id is required",
-                "errorMessage": "quote_id is required",
-            }
-        qid = str(qid).strip()
-        if not qid.startswith("0Q0"):
-            return {
-                "success": False,
-                "error": f"Invalid Quote Id (expected 0Q0 prefix): {qid}",
-                "errorMessage": f"Invalid Quote Id: {qid}",
-            }
+    args = _normalize_quote_id_args(arguments if isinstance(arguments, dict) else {})
+    raw_in = args.get("quote_id")
+    if not raw_in or not str(raw_in).strip():
+        err = (
+            "quote_id (or quoteId) is required. Use a Quote Id (0Q0...) or Opportunity Id (006...); "
+            "opportunity_id is accepted if quote_id is omitted."
+        )
+        qr = _apex_quote_result_payload(None, _empty_snap_for_apex(), error_message=err)
+        return {"success": False, "error": err, "errorMessage": err, "quoteResult": qr}
 
+    raw = str(raw_in).strip()
+    resolved_from_opportunity_id: Optional[str] = None
+    qid: Optional[str] = None
+
+    if raw.startswith("0Q0") and _is_salesforce_id(raw):
+        qid = raw
+    elif raw.startswith("006") and _is_salesforce_id(raw):
+        resolved_from_opportunity_id = raw
+        qid = _quote_id_for_opportunity(sf, raw)
+        if not qid:
+            snap_opp = _fetch_opportunity_minimal_for_apex(sf, raw)
+            err = (
+                f"No Quote found on Opportunity {raw}. Create a quote for this opportunity first, "
+                "then call accept again (Opportunity Id is accepted and resolves to the latest Quote)."
+            )
+            return {
+                "success": False,
+                "error": err,
+                "errorMessage": err,
+                "opportunity_id": raw,
+                "quoteResult": _apex_quote_result_payload(None, snap_opp, error_message=err),
+            }
+    else:
+        err = (
+            f"Invalid Id {raw!r}: pass a Quote Id (0Q0..., 15 or 18 chars) or an Opportunity Id "
+            f"(006..., 15 or 18 chars). The server resolves the most recently modified Quote on that Opportunity."
+        )
+        return {
+            "success": False,
+            "error": err,
+            "errorMessage": err,
+            "quoteResult": _apex_quote_result_payload(None, _empty_snap_for_apex(), error_message=err),
+        }
+
+    try:
         quote_sf = SFType("Quote", sf.session_id, sf.sf_instance)
         quote_sf.update(qid, {"Status": status})
 
@@ -540,10 +697,12 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
             "accountPhone": oa.get("account_phone"),
             "accountIndustry": oa.get("account_industry"),
             "message": f"Quote status set to {status}.",
+            "quoteResult": _apex_quote_result_payload(qid, snap, error_message=None),
         }
+        if resolved_from_opportunity_id:
+            out["quote_id_resolved_from_opportunity_id"] = resolved_from_opportunity_id
         if str(status).strip() == str(QUOTE_STATUS_ACCEPTED).strip():
             out["product_skus_on_accept"] = sku_rows
-            out["quoteResult"] = _apex_quote_result_payload(qid, snap, error_message=None)
             acc_line = snap.get("ui_account_header") or (
                 f"Account: {oa.get('account_name') or '(n/a)'}  |  Account Id: {oa.get('account_id') or '(n/a)'}"
             )
@@ -559,7 +718,22 @@ def set_quote_status_tool(sf: Any, arguments: Dict[str, Any], status: str) -> Di
     except Exception as e:
         err = str(e)
         print(f"[Quote ERROR] set_quote_status: {err}", file=sys.stderr)
-        return {"success": False, "error": err, "errorMessage": err}
+        snap_fb: Dict[str, Any] = _empty_snap_for_apex()
+        try:
+            snap_fb = _fetch_quote_snapshot(sf, qid)
+        except Exception:
+            if resolved_from_opportunity_id:
+                try:
+                    snap_fb = _fetch_opportunity_minimal_for_apex(sf, resolved_from_opportunity_id)
+                except Exception:
+                    pass
+        return {
+            "success": False,
+            "error": err,
+            "errorMessage": err,
+            "quote_id": qid,
+            "quoteResult": _apex_quote_result_payload(qid, snap_fb, error_message=err),
+        }
 
 
 def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
@@ -575,19 +749,41 @@ def _fetch_quote_snapshot(sf: Any, quote_id: str) -> Dict[str, Any]:
     qrecs = qr.get("records") or []
     quote_row = qrecs[0] if qrecs else None
 
-    p2_fields = _product2_sku_select_fragment()
+    p2_names = _product2_sku_names_for_query(probe_sku_c=_AUTO_PROBE_PRODUCT2_SKU__C)
+    p2_fields = _product2_sku_select_fragment_from_names(p2_names)
     q_li = (
         "SELECT Id, LineNumber, Quantity, UnitPrice, ListPrice, Subtotal, Discount, TotalPrice, "
         f"Description, {p2_fields} "
         f"FROM QuoteLineItem WHERE QuoteId = '{esc}' ORDER BY LineNumber, CreatedDate"
     )
-    lines = _soql_query_all_records(sf, q_li)
+    try:
+        lines = _soql_query_all_records(sf, q_li)
+    except Exception as e1:
+        if _AUTO_PROBE_PRODUCT2_SKU__C and _DEFAULT_PROBE_SKU_FIELD in p2_names and _soql_error_suggests_missing_sku_c(
+            e1
+        ):
+            print(
+                f"[Quote] QuoteLineItem SOQL omitting {_DEFAULT_PROBE_SKU_FIELD} (org has no field): {e1}",
+                file=sys.stderr,
+            )
+            p2_names = _product2_sku_names_for_query(probe_sku_c=False)
+            p2_fields = _product2_sku_select_fragment_from_names(p2_names)
+            q_li = (
+                "SELECT Id, LineNumber, Quantity, UnitPrice, ListPrice, Subtotal, Discount, TotalPrice, "
+                f"Description, {p2_fields} "
+                f"FROM QuoteLineItem WHERE QuoteId = '{esc}' ORDER BY LineNumber, CreatedDate"
+            )
+            lines = _soql_query_all_records(sf, q_li)
+        else:
+            raise
 
     line_details: List[Dict[str, Any]] = []
     for row in lines:
         pbe = row.get("PricebookEntry") or {}
         p2 = pbe.get("Product2") if isinstance(pbe.get("Product2"), dict) else {}
-        sku_bundle = _resolved_product_sku_bundle(p2) if isinstance(p2, dict) else {}
+        sku_bundle = (
+            _resolved_product_sku_bundle(p2, field_names=p2_names) if isinstance(p2, dict) else {}
+        )
         line_details.append(
             {
                 "Id": row.get("Id"),
