@@ -280,14 +280,13 @@ def get_lead_tools() -> List[Dict[str, Any]]:
         {
             "name": "SALESFORCE_CONVERT_LEAD",
             "description": (
-                "Converts a lead with a fixed business flow: always creates a new Account and Contact, "
-                "always creates an Opportunity named after the lead, overwriteLeadSource=false, "
-                "no owner notification email, converted status 'Converted', then standard price book, "
-                "Lead_Product__c line items, and Opportunity_PlatformEvent__e. "
+                "Converts a lead to an Opportunity (and Contact). By default creates a new Account "
+                "named FirstName + LastName (Lead.Company is set to that before convert). Pass "
+                "account_id only to attach to an existing Account instead of creating a new one. "
+                "Always creates an Opportunity named after the lead unless do_not_create_opportunity=true. "
+                "Then standard price book, Lead_Product__c line items, and Opportunity_PlatformEvent__e. "
                 "Tries Apex REST POST /services/apexrest/convertLead first (JWT), then REST LeadConvert "
-                "quick action, then SOAP only if SF_SOAP_PASSWORD is set or SF_SOAP_ALLOW_JWT=1. "
-                "Set SF_APEX_CONVERT_LEAD_DISABLED=1 to skip Apex. SF_APEX_CONVERT_LEAD_PATH overrides "
-                "the apexrest path segment (default convertLead)."
+                "quick action, then SOAP only if SF_SOAP_PASSWORD is set or SF_SOAP_ALLOW_JWT=1."
             ),
             "inputSchema": {
                 "type": "object",
@@ -295,8 +294,25 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                     "lead_id": {"type": "string", "description": "15 or 18 character Lead Id"},
                     "leadId": {"type": "string", "description": "Same as lead_id"},
                     "id": {"type": "string", "description": "Same as lead_id"},
+                    "account_id": {
+                        "type": "string",
+                        "description": (
+                            "Existing Account Id (15/18 char). When set, Salesforce links the "
+                            "converted Opportunity to this account and does not create a new Account."
+                        ),
+                    },
+                    "accountId": {"type": "string", "description": "Same as account_id"},
+                    "contact_id": {
+                        "type": "string",
+                        "description": "Optional existing Contact Id to link on convert.",
+                    },
+                    "contactId": {"type": "string", "description": "Same as contact_id"},
+                    "do_not_create_opportunity": {
+                        "type": "boolean",
+                        "description": "If true, only convert to Account/Contact (default false).",
+                    },
                 },
-                "description": "Provide lead_id, leadId, or id. All other convert flags are fixed in code.",
+                "description": "Provide lead_id, leadId, or id. Prefer account_id when the lead should not create a new Account.",
             },
         },
     ]
@@ -323,6 +339,60 @@ def _normalize_lead_id_in_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]
             out["lead_id"] = str(v).strip()
             break
     return out
+
+
+def _normalize_convert_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize lead_id plus optional account_id / contact_id for convert."""
+    out = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
+    for alt, target in (
+        ("accountId", "account_id"),
+        ("AccountId", "account_id"),
+        ("existing_account_id", "account_id"),
+        ("ExistingAccountId", "account_id"),
+        ("contactId", "contact_id"),
+        ("ContactId", "contact_id"),
+        ("existing_contact_id", "contact_id"),
+    ):
+        if out.get(target) and str(out[target]).strip():
+            out[target] = str(out[target]).strip()
+            continue
+        v = out.get(alt)
+        if v is not None and str(v).strip():
+            out[target] = str(v).strip()
+    dnc = out.get("do_not_create_opportunity")
+    if dnc is None:
+        dnc = out.get("doNotCreateOpportunity")
+    if dnc is not None:
+        out["do_not_create_opportunity"] = bool(dnc)
+    return out
+
+
+def _account_name_from_lead_person(lead_row: Dict[str, Any]) -> str:
+    """New Account name on convert: always Lead FirstName + LastName."""
+    first = (lead_row.get("FirstName") or "").strip()
+    last = (lead_row.get("LastName") or "").strip()
+    person = f"{first} {last}".strip() or (lead_row.get("Name") or "").strip()
+    return person or "Unknown Account"
+
+
+def _set_lead_company_for_new_account_convert(
+    sf: Any, lead_id: str, lead_row: Dict[str, Any]
+) -> str:
+    """
+    Before convert (new Account path), set Lead.Company to FirstName + LastName so
+    Salesforce creates Account with that name. Returns the company value applied.
+    """
+    new_company = _account_name_from_lead_person(lead_row)
+    current = (lead_row.get("Company") or "").strip()
+    if current == new_company:
+        return new_company
+    lead_sf = SFType("Lead", sf.session_id, sf.sf_instance)
+    lead_sf.update(lead_id, {"Company": new_company})
+    print(
+        f"[Lead] Set Company for new Account on convert: {current!r} -> {new_company!r}",
+        file=sys.stderr,
+    )
+    return new_company
 
 
 def _query_lead_row_by_id(sf: Any, lead_id: str) -> Optional[Dict[str, Any]]:
@@ -404,7 +474,7 @@ def create_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         company_raw = arguments.get("company")
         company = str(company_raw).strip() if company_raw is not None else ""
         if not company:
-            company = "(Not specified)"
+            company = f"{str(first_name).strip()} {str(last_name).strip()}".strip() or "(Not specified)"
 
         lead_data = {
             "LastName": str(last_name).strip(),
@@ -973,10 +1043,22 @@ def _build_partner_convert_soap_envelope(
     lead_id: str,
     converted_status: str,
     opportunity_name: str,
+    account_id: Optional[str] = None,
+    contact_id: Optional[str] = None,
+    do_not_create_opportunity: bool = False,
 ) -> str:
     lid = escape(str(lead_id), entities={"'": "&apos;", '"': "&quot;"})
     cst = escape(str(converted_status), entities={"'": "&apos;", '"': "&quot;"})
     onm = escape(str(opportunity_name), entities={"'": "&apos;", '"': "&quot;"})
+    acc_xml = ""
+    if account_id and str(account_id).strip():
+        aid = escape(str(account_id).strip(), entities={"'": "&apos;", '"': "&quot;"})
+        acc_xml = f"\n        <urn:accountId>{aid}</urn:accountId>"
+    con_xml = ""
+    if contact_id and str(contact_id).strip():
+        cid = escape(str(contact_id).strip(), entities={"'": "&apos;", '"': "&quot;"})
+        con_xml = f"\n        <urn:contactId>{cid}</urn:contactId>"
+    dnc_opp = "true" if do_not_create_opportunity else "false"
     if include_session_header:
         sid_cdata = _soap_session_id_cdata(session_id)
         header_xml = (
@@ -996,9 +1078,9 @@ def _build_partner_convert_soap_envelope(
       <urn:leadConverts>
         <urn:leadId>{lid}</urn:leadId>
         <urn:convertedStatus>{cst}</urn:convertedStatus>
-        <urn:doNotCreateOpportunity>false</urn:doNotCreateOpportunity>
+        <urn:doNotCreateOpportunity>{dnc_opp}</urn:doNotCreateOpportunity>
         <urn:overwriteLeadSource>false</urn:overwriteLeadSource>
-        <urn:sendNotificationEmail>false</urn:sendNotificationEmail>
+        <urn:sendNotificationEmail>false</urn:sendNotificationEmail>{acc_xml}{con_xml}
         <urn:opportunityName>{onm}</urn:opportunityName>
       </urn:leadConverts>
     </urn:convertLead>
@@ -1006,7 +1088,11 @@ def _build_partner_convert_soap_envelope(
 </soapenv:Envelope>"""
 
 
-def _parse_soap_convert_lead_response(resp: requests.Response) -> Tuple[str, str, str]:
+def _parse_soap_convert_lead_response(
+    resp: requests.Response,
+    *,
+    do_not_create_opportunity: bool = False,
+) -> Tuple[str, str, str]:
     if resp.status_code >= 300:
         raise RuntimeError(f"SOAP convertLead HTTP {resp.status_code}: {resp.text[:2500]}")
 
@@ -1045,11 +1131,11 @@ def _parse_soap_convert_lead_response(resp: requests.Response) -> Tuple[str, str
     opp_id = r0.get("opportunityId")
     if not acc_id or not con_id:
         raise RuntimeError(f"SOAP convertLead missing account/contact: {r0}")
-    if not opp_id:
+    if not opp_id and not do_not_create_opportunity:
         raise RuntimeError(
             "SOAP convertLead did not return opportunityId; org may block opportunity on convert."
         )
-    return acc_id, con_id, opp_id
+    return acc_id, con_id, opp_id or ""
 
 
 def _convert_lead_soap(
@@ -1057,6 +1143,9 @@ def _convert_lead_soap(
     lead_id: str,
     converted_status: str,
     opportunity_name: str,
+    account_id: Optional[str] = None,
+    contact_id: Optional[str] = None,
+    do_not_create_opportunity: bool = False,
 ) -> Tuple[str, str, str]:
     """
     Partner SOAP convertLead when REST quick action is unavailable.
@@ -1097,9 +1186,14 @@ def _convert_lead_soap(
                 lead_id=lead_id,
                 converted_status=converted_status,
                 opportunity_name=opportunity_name,
+                account_id=account_id,
+                contact_id=contact_id,
+                do_not_create_opportunity=do_not_create_opportunity,
             )
             r0 = requests.post(convert_url, data=env0.encode("utf-8"), headers=base_headers, timeout=120)
-            return _parse_soap_convert_lead_response(r0)
+            return _parse_soap_convert_lead_response(
+                r0, do_not_create_opportunity=do_not_create_opportunity
+            )
         except Exception as ex0:
             errors.append(f"soap_password_login: {ex0}")
 
@@ -1110,11 +1204,16 @@ def _convert_lead_soap(
             lead_id=lead_id,
             converted_status=converted_status,
             opportunity_name=opportunity_name,
+            account_id=account_id,
+            contact_id=contact_id,
+            do_not_create_opportunity=do_not_create_opportunity,
         )
         h1 = dict(base_headers)
         h1["Authorization"] = f"Bearer {token}"
         r1 = requests.post(url, data=env1.encode("utf-8"), headers=h1, timeout=120)
-        return _parse_soap_convert_lead_response(r1)
+        return _parse_soap_convert_lead_response(
+            r1, do_not_create_opportunity=do_not_create_opportunity
+        )
     except Exception as ex1:
         errors.append(f"bearer_header: {ex1}")
 
@@ -1125,9 +1224,14 @@ def _convert_lead_soap(
             lead_id=lead_id,
             converted_status=converted_status,
             opportunity_name=opportunity_name,
+            account_id=account_id,
+            contact_id=contact_id,
+            do_not_create_opportunity=do_not_create_opportunity,
         )
         r2 = requests.post(url, data=env2.encode("utf-8"), headers=base_headers, timeout=120)
-        return _parse_soap_convert_lead_response(r2)
+        return _parse_soap_convert_lead_response(
+            r2, do_not_create_opportunity=do_not_create_opportunity
+        )
     except Exception as ex2:
         errors.append(f"session_header: {ex2}")
 
@@ -1220,6 +1324,9 @@ def _try_convert_lead_apex_rest(
     lead_id: str,
     converted_status: str,
     opportunity_name: str,
+    account_id: Optional[str] = None,
+    contact_id: Optional[str] = None,
+    do_not_create_opportunity: bool = False,
 ) -> Optional[Tuple[str, str, str]]:
     """
     POST /services/apexrest/<path> with OAuth Bearer (same token as REST API).
@@ -1235,10 +1342,14 @@ def _try_convert_lead_apex_rest(
     body: Dict[str, Any] = {
         "leadID": str(lead_id).strip(),
         "convertedStatus": str(converted_status).strip(),
-        "createOpportunity": True,
+        "createOpportunity": not do_not_create_opportunity,
         "opportunityName": str(opportunity_name).strip(),
         "sendEmailToOwner": False,
     }
+    if account_id and str(account_id).strip():
+        body["accountId"] = str(account_id).strip()
+    if contact_id and str(contact_id).strip():
+        body["contactId"] = str(contact_id).strip()
     headers = {
         "Authorization": f"Bearer {sf.session_id}",
         "Content-Type": "application/json",
@@ -1257,8 +1368,8 @@ def _try_convert_lead_apex_rest(
         msg = data.get("message") or data.get("error") or data.get("errors") or data
         raise RuntimeError(f"Apex convertLead reported failure: {msg}")
     acc, con, opp = _parse_apex_convert_lead_response(data)
-    if acc and con and opp:
-        return str(acc), str(con), str(opp)
+    if acc and con and (opp or do_not_create_opportunity):
+        return str(acc), str(con), str(opp) if opp else ""
     if acc or con or opp:
         raise RuntimeError(
             f"Apex convertLead returned incomplete ids (account={acc!r}, contact={con!r}, opp={opp!r}): {data!r}"
@@ -1343,7 +1454,7 @@ def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str)
     return {"line_items_created": line_items_created, "notes": notes}
 
 
-def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
+def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]) -> Dict[str, Any]:
     """
     Single attempt: Apex REST convertLead, then REST quick action LeadConvert, then SOAP
     (only if SF_SOAP_PASSWORD or SF_SOAP_ALLOW_JWT=1); then post-convert steps.
@@ -1352,6 +1463,14 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
     lead_row = _query_lead_row_by_id(sf, lead_id)
     if not lead_row:
         raise RuntimeError(f"No Lead found with Id {lead_id}")
+
+    existing_account_id = (convert_options.get("account_id") or "").strip() or None
+    existing_contact_id = (convert_options.get("contact_id") or "").strip() or None
+    do_not_create_opportunity = bool(convert_options.get("do_not_create_opportunity"))
+
+    if not existing_account_id:
+        lead_row["Company"] = _set_lead_company_for_new_account_convert(sf, lead_id, lead_row)
+
     first = (lead_row.get("FirstName") or "").strip()
     last = (lead_row.get("LastName") or "").strip()
     lead_name = (lead_row.get("Name") or f"{first} {last}".strip() or "Lead").strip()
@@ -1363,9 +1482,13 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
         "convertedStatus": str(converted_status).strip(),
         "overwriteLeadSource": False,
         "sendNotificationEmail": False,
-        "doNotCreateOpportunity": False,
+        "doNotCreateOpportunity": do_not_create_opportunity,
         "opportunityName": str(opportunity_name).strip(),
     }
+    if existing_account_id:
+        payload["accountId"] = existing_account_id
+    if existing_contact_id:
+        payload["contactId"] = existing_contact_id
 
     path = f"sobjects/Lead/{lead_id}/actions/quick/LeadConvert"
     acc_id: Optional[str] = None
@@ -1374,7 +1497,13 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
     convert_via = "rest"
 
     apex_triplet = _try_convert_lead_apex_rest(
-        sf, str(lead_id), converted_status, str(opportunity_name).strip()
+        sf,
+        str(lead_id),
+        converted_status,
+        str(opportunity_name).strip(),
+        account_id=existing_account_id,
+        contact_id=existing_contact_id,
+        do_not_create_opportunity=do_not_create_opportunity,
     )
     if apex_triplet:
         acc_id, con_id, opp_id = apex_triplet
@@ -1406,15 +1535,23 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
                 )
             convert_via = "soap"
             acc_id, con_id, opp_id = _convert_lead_soap(
-                sf, str(lead_id), converted_status, str(opportunity_name).strip()
+                sf,
+                str(lead_id),
+                converted_status,
+                str(opportunity_name).strip(),
+                account_id=existing_account_id,
+                contact_id=existing_contact_id,
+                do_not_create_opportunity=do_not_create_opportunity,
             )
 
+    if existing_account_id:
+        acc_id = acc_id or existing_account_id
     if not acc_id and not con_id:
         raise RuntimeError("Lead convert returned no account or contact id")
-    if not opp_id:
+    if not do_not_create_opportunity and not opp_id:
         raise RuntimeError(
             "Lead convert did not return an opportunity id; ensure the org allows creating "
-            "an opportunity on convert (this tool always requests one)."
+            "an opportunity on convert, or pass account_id to link to an existing account."
         )
 
     result: Dict[str, Any] = {
@@ -1425,15 +1562,21 @@ def _convert_lead_execute(sf: Any, lead_id: str) -> Dict[str, Any]:
         "converted_status": converted_status,
         "opportunity_name": opportunity_name,
         "convert_via": convert_via,
+        "used_existing_account": bool(existing_account_id),
     }
+    if existing_account_id:
+        result["existing_account_id"] = existing_account_id
 
-    try:
-        extras = _post_convert_opportunity_extras(sf, lead_id, opp_id)
-        result["line_items_created"] = extras["line_items_created"]
-        if extras.get("notes"):
-            result["notes"] = extras["notes"]
-    except Exception as post_ex:
-        result["post_convert_warning"] = str(post_ex)
+    if opp_id:
+        try:
+            extras = _post_convert_opportunity_extras(sf, lead_id, opp_id)
+            result["line_items_created"] = extras["line_items_created"]
+            if extras.get("notes"):
+                result["notes"] = extras["notes"]
+        except Exception as post_ex:
+            result["post_convert_warning"] = str(post_ex)
+            result["line_items_created"] = 0
+    else:
         result["line_items_created"] = 0
 
     print(f"[Lead] Converted lead {lead_id} -> account={acc_id} contact={con_id} opp={opp_id}", file=sys.stderr)
@@ -1446,7 +1589,7 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     LeadConvert, else SOAP; then standard price book, platform event, and Lead_Product__c line items.
     Retries once after a fresh JWT login if the session is invalid (SOAP/REST).
     """
-    args = _normalize_lead_id_in_arguments(arguments if isinstance(arguments, dict) else {})
+    args = _normalize_convert_arguments(arguments if isinstance(arguments, dict) else {})
     lead_id = args.get("lead_id")
     if not lead_id:
         return {
@@ -1457,13 +1600,18 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
             "opportunity_id": None,
         }
 
+    convert_options = {
+        "account_id": args.get("account_id"),
+        "contact_id": args.get("contact_id"),
+        "do_not_create_opportunity": args.get("do_not_create_opportunity", False),
+    }
     lid = str(lead_id).strip()
     for attempt in range(2):
         try:
             if attempt > 0:
                 invalidate_salesforce_session()
                 sf = get_salesforce()
-            return _convert_lead_execute(sf, lid)
+            return _convert_lead_execute(sf, lid, convert_options)
         except Exception as e:
             if attempt == 0 and _salesforce_session_should_retry(e):
                 print(
