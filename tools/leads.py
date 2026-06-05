@@ -285,8 +285,8 @@ def get_lead_tools() -> List[Dict[str, Any]]:
                 "account_id only to attach to an existing Account instead of creating a new one. "
                 "Always creates an Opportunity named after the lead unless do_not_create_opportunity=true. "
                 "Then standard price book, Lead_Product__c line items, and Opportunity_PlatformEvent__e. "
-                "Tries Apex REST POST /services/apexrest/convertLead first (JWT), then REST LeadConvert "
-                "quick action, then SOAP only if SF_SOAP_PASSWORD is set or SF_SOAP_ALLOW_JWT=1."
+                "Uses org Apex ConvertLeadRestApi at /services/apexrest/convertLead (see LEAD_CONVERT_SETUP.md), "
+                "then REST LeadConvert, then Partner SOAP."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1289,34 +1289,81 @@ def _parse_lead_convert_response(resp: Any) -> Tuple[Optional[str], Optional[str
 
 
 def _parse_apex_convert_lead_response(data: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Parse JSON from POST /services/apexrest/convertLead (custom Apex shapes)."""
+    """Parse JSON from Apex REST (ConvertLeadRestApi / LeadConversionResponse shapes)."""
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
         return None, None, None
     inner: Any = data
-    for key in ("result", "data", "output", "response"):
+    for key in ("result", "data", "output", "response", "leadConversionResponse"):
         if isinstance(data.get(key), dict):
             inner = data[key]
             break
     if not isinstance(inner, dict):
         return None, None, None
-    acc = (
-        inner.get("accountId")
-        or inner.get("AccountId")
-        or inner.get("account_id")
-    )
-    con = (
-        inner.get("contactId")
-        or inner.get("ContactId")
-        or inner.get("contact_id")
-    )
-    opp = (
-        inner.get("opportunityId")
-        or inner.get("OpportunityId")
-        or inner.get("opportunity_id")
-    )
+
+    def _pick(row: Dict[str, Any], *keys: str) -> Optional[str]:
+        for k in keys:
+            v = row.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return None
+
+    acc = _pick(inner, "accountId", "AccountId", "account_id", "accountID")
+    con = _pick(inner, "contactId", "ContactId", "contact_id", "contactID")
+    opp = _pick(inner, "opportunityId", "OpportunityId", "opportunity_id", "opportunityID")
     return acc, con, opp
+
+
+def _build_apex_convert_request_body(
+    lead_id: str,
+    converted_status: str,
+    opportunity_name: str,
+    *,
+    account_id: Optional[str] = None,
+    contact_id: Optional[str] = None,
+    do_not_create_opportunity: bool = False,
+) -> Dict[str, Any]:
+    """
+    JSON body aligned with org Apex LeadConversionRequest (ConvertLeadRestApi).
+    Sends both leadId and leadID because Apex JSON property names must match the class exactly.
+    """
+    lid = str(lead_id).strip()
+    body: Dict[str, Any] = {
+        "leadId": lid,
+        "leadID": lid,
+        "convertedStatus": str(converted_status).strip(),
+        "createOpportunity": not do_not_create_opportunity,
+        "opportunityName": str(opportunity_name).strip(),
+        "overWriteLeadSource": False,
+        "overwriteLeadSource": False,
+        "sendNotificationEmail": False,
+        "sendEmailToOwner": False,
+    }
+    if account_id and str(account_id).strip():
+        body["accountId"] = str(account_id).strip()
+    if contact_id and str(contact_id).strip():
+        body["contactId"] = str(contact_id).strip()
+    return body
+
+
+def _apex_convert_rest_urls(sf: Any, path_seg: str, lead_id: str) -> List[str]:
+    """URLs for @RestResource(urlMapping='/convertLead/*') and plain /convertLead."""
+    base = f"https://{sf.sf_instance}/services/apexrest"
+    seg = path_seg.strip().strip("/") or DEFAULT_APEX_CONVERT_LEAD_PATH
+    lid = str(lead_id).strip()
+    candidates = [
+        f"{base}/{seg}",
+        f"{base}/{seg}/",
+        f"{base}/{seg}/{lid}",
+    ]
+    seen: set = set()
+    out: List[str] = []
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 def _try_convert_lead_apex_rest(
@@ -1329,8 +1376,8 @@ def _try_convert_lead_apex_rest(
     do_not_create_opportunity: bool = False,
 ) -> Optional[Tuple[str, str, str]]:
     """
-    POST /services/apexrest/<path> with OAuth Bearer (same token as REST API).
-    Returns (accountId, contactId, opportunityId) on success, None if disabled or 404 (no route).
+    POST /services/apexrest/convertLead (ConvertLeadRestApi) with OAuth Bearer.
+    Returns (accountId, contactId, opportunityId) on success, None if all routes return 404.
     """
     if os.getenv("SF_APEX_CONVERT_LEAD_DISABLED", "").strip().lower() in ("1", "true", "yes"):
         return None
@@ -1338,43 +1385,91 @@ def _try_convert_lead_apex_rest(
         os.getenv("SF_APEX_CONVERT_LEAD_PATH", DEFAULT_APEX_CONVERT_LEAD_PATH).strip().strip("/")
         or DEFAULT_APEX_CONVERT_LEAD_PATH
     )
-    url = f"https://{sf.sf_instance}/services/apexrest/{path_seg}"
-    body: Dict[str, Any] = {
-        "leadID": str(lead_id).strip(),
-        "convertedStatus": str(converted_status).strip(),
-        "createOpportunity": not do_not_create_opportunity,
-        "opportunityName": str(opportunity_name).strip(),
-        "sendEmailToOwner": False,
-    }
-    if account_id and str(account_id).strip():
-        body["accountId"] = str(account_id).strip()
-    if contact_id and str(contact_id).strip():
-        body["contactId"] = str(contact_id).strip()
+    body = _build_apex_convert_request_body(
+        lead_id,
+        converted_status,
+        opportunity_name,
+        account_id=account_id,
+        contact_id=contact_id,
+        do_not_create_opportunity=do_not_create_opportunity,
+    )
     headers = {
         "Authorization": f"Bearer {sf.session_id}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    resp = requests.post(url, json=body, headers=headers, timeout=120)
-    if resp.status_code == 404:
-        return None
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Apex convertLead HTTP {resp.status_code}: {resp.text[:2500]}")
-    try:
-        data = resp.json()
-    except ValueError:
-        raise RuntimeError(f"Apex convertLead: response was not JSON: {resp.text[:2500]}") from None
-    if isinstance(data, dict) and data.get("success") is False:
-        msg = data.get("message") or data.get("error") or data.get("errors") or data
-        raise RuntimeError(f"Apex convertLead reported failure: {msg}")
-    acc, con, opp = _parse_apex_convert_lead_response(data)
-    if acc and con and (opp or do_not_create_opportunity):
-        return str(acc), str(con), str(opp) if opp else ""
-    if acc or con or opp:
+    last_404_text = ""
+    for url in _apex_convert_rest_urls(sf, path_seg, lead_id):
+        resp = requests.post(url, json=body, headers=headers, timeout=120)
+        if resp.status_code == 404:
+            last_404_text = resp.text[:500]
+            print(f"[Lead] Apex convert 404 at {url}", file=sys.stderr)
+            continue
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Apex convertLead HTTP {resp.status_code} at {url}: {resp.text[:2500]}"
+            )
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Apex convertLead: response was not JSON from {url}: {resp.text[:2500]}"
+            ) from None
+        if isinstance(data, dict) and (
+            data.get("success") is False or data.get("isSuccess") is False
+        ):
+            msg = (
+                data.get("message")
+                or data.get("errorMessage")
+                or data.get("error")
+                or data.get("errors")
+                or data
+            )
+            raise RuntimeError(f"Apex convertLead reported failure: {msg}")
+        acc, con, opp = _parse_apex_convert_lead_response(data)
+        if acc and con and (opp or do_not_create_opportunity):
+            print(f"[Lead] Apex convert succeeded via {url}", file=sys.stderr)
+            return str(acc), str(con), str(opp) if opp else ""
+        if acc or con or opp:
+            raise RuntimeError(
+                f"Apex convertLead returned incomplete ids (account={acc!r}, contact={con!r}, "
+                f"opp={opp!r}) from {url}: {data!r}"
+            )
         raise RuntimeError(
-            f"Apex convertLead returned incomplete ids (account={acc!r}, contact={con!r}, opp={opp!r}): {data!r}"
+            f"Apex convertLead returned no account/contact/opportunity ids from {url}: {data!r}"
         )
-    raise RuntimeError(f"Apex convertLead returned no account/contact/opportunity ids: {data!r}")
+    if last_404_text:
+        print(f"[Lead] Apex convert last 404 body: {last_404_text}", file=sys.stderr)
+    return None
+
+
+def _resolve_converted_status(sf: Any, preferred: str = "Converted") -> str:
+    """Pick a valid converted LeadStatus MasterLabel for this org."""
+    try:
+        res = sf.query(
+            "SELECT MasterLabel FROM LeadStatus WHERE IsConverted = true "
+            "ORDER BY SortOrder ASC LIMIT 20"
+        )
+        labels = [
+            str(r.get("MasterLabel") or "").strip()
+            for r in (res.get("records") or [])
+            if r.get("MasterLabel")
+        ]
+        if preferred in labels:
+            return preferred
+        if labels:
+            return labels[0]
+    except Exception as ex:
+        print(f"[Lead] LeadStatus query failed, using default: {ex}", file=sys.stderr)
+    return preferred
+
+
+def _lead_convert_unavailable_message(lead_id: str, detail: str) -> str:
+    return (
+        f"Lead {lead_id} could not be converted. {detail} "
+        "Ensure ConvertLeadRestApi is deployed and the integration user can access it "
+        "(see LEAD_CONVERT_SETUP.md), or set SF_SOAP_PASSWORD on the MCP server, then redeploy Azure."
+    )
 
 
 def _get_standard_pricebook_id(sf: Any) -> str:
@@ -1475,7 +1570,7 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
     last = (lead_row.get("LastName") or "").strip()
     lead_name = (lead_row.get("Name") or f"{first} {last}".strip() or "Lead").strip()
 
-    converted_status = "Converted"
+    converted_status = _resolve_converted_status(sf, "Converted")
     opportunity_name = lead_name
 
     payload: Dict[str, Any] = {
@@ -1512,27 +1607,41 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
         try:
             raw = sf.restful(path, method="POST", json=payload)
             acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
-        except SalesforceResourceNotFound:
-            soap_pw = os.getenv("SF_SOAP_PASSWORD")
-            allow_jwt_soap = os.getenv("SF_SOAP_ALLOW_JWT", "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
+        except (SalesforceResourceNotFound, SalesforceError) as rest_ex:
+            rest_fail = str(rest_ex)
+            if isinstance(rest_ex, SalesforceError) and getattr(rest_ex, "status", None) not in (
+                None,
+                404,
+            ):
+                raise
+            print(
+                f"[Lead] REST LeadConvert unavailable ({rest_fail[:200]}); trying Partner SOAP...",
+                file=sys.stderr,
             )
-            if not (soap_pw and str(soap_pw).strip()) and not allow_jwt_soap:
-                print(
-                    "[Lead] Skipping Partner SOAP convertLead: no SF_SOAP_PASSWORD and "
-                    "SF_SOAP_ALLOW_JWT is not set (JWT-only SOAP fails in many orgs).",
-                    file=sys.stderr,
+            try:
+                convert_via = "soap"
+                acc_id, con_id, opp_id = _convert_lead_soap(
+                    sf,
+                    str(lead_id),
+                    converted_status,
+                    str(opportunity_name).strip(),
+                    account_id=existing_account_id,
+                    contact_id=existing_contact_id,
+                    do_not_create_opportunity=do_not_create_opportunity,
                 )
+            except Exception as soap_ex:
                 raise RuntimeError(
-                    "Lead convert: Apex REST /services/apexrest/convertLead was not used or returned 404, "
-                    "and REST quick action sobjects/Lead/.../actions/quick/LeadConvert returned 404. "
-                    "Partner SOAP with JWT is skipped by default. Fix: deploy the Apex REST convert "
-                    "endpoint, expose the LeadConvert quick action to the integration user, set "
-                    "SF_SOAP_PASSWORD for SOAP login(), or set SF_SOAP_ALLOW_JWT=1 to attempt legacy "
-                    "JWT SOAP (often INVALID_SESSION_ID / Illegal Session)."
-                )
+                    _lead_convert_unavailable_message(
+                        str(lead_id),
+                        "Apex REST /services/apexrest/convertLead is not deployed (404), "
+                        "REST LeadConvert quick action is not available, and SOAP convertLead failed. "
+                        f"SOAP error: {soap_ex}",
+                    )
+                ) from soap_ex
+        except Exception as rest_other:
+            if "404" not in str(rest_other) and "NOT_FOUND" not in str(rest_other).upper():
+                raise
+            print(f"[Lead] REST LeadConvert failed; trying Partner SOAP: {rest_other}", file=sys.stderr)
             convert_via = "soap"
             acc_id, con_id, opp_id = _convert_lead_soap(
                 sf,
@@ -1621,13 +1730,25 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             err = str(e)
             print(f"[Lead ERROR] convert_lead: {err}", file=sys.stderr)
-            return {
+            out: Dict[str, Any] = {
                 "success": False,
                 "error": err,
+                "error_code": "LEAD_CONVERT_FAILED",
+                "lead_id": lid,
                 "account_id": None,
                 "contact_id": None,
                 "opportunity_id": None,
             }
+            if "could not be converted" in err or "convertLead" in err.lower():
+                out["error_code"] = "LEAD_CONVERT_UNAVAILABLE"
+                out["setup_doc"] = "LEAD_CONVERT_SETUP.md"
+                out["fix_steps"] = [
+                    "Grant integration user access to ConvertLeadRestApi and Connected App OAuth scopes",
+                    "Confirm POST https://<instance>/services/apexrest/convertLead returns 200 (not 404)",
+                    "Redeploy/restart the MCP server so tools/leads.py Apex payload matches LeadConversionRequest",
+                    "Or set SF_SOAP_PASSWORD (password + security token) on Azure App Service",
+                ]
+            return out
 
     return {
         "success": False,
