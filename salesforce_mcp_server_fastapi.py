@@ -18,6 +18,7 @@ import uvicorn
 from salesforce_config import get_salesforce
 
 # Import all tool modules
+from tools.leads import LEAD_CONVERT_BUILD, diagnose_lead_convert_health
 from tools import (
     get_account_tools, handle_account_tool_call,
     get_contact_tools, handle_contact_tool_call,
@@ -133,7 +134,9 @@ async def ui_session_echo_header(request: Request, call_next):
 def get_all_tools() -> list:
     """Get all available MCP tools from all modules"""
     tools = []
-    # Quote tools first so MCP clients that truncate the tool list still expose accept/reject.
+    # SOQL module first: includes SALESFORCE_UPDATE_SOBJECT (generic Quote Status) for clients
+    # that omit quote-specific tools from tools/list.
+    tools.extend(get_soql_tools())
     tools.extend(get_quote_tools())
     tools.extend(get_account_tools())
     tools.extend(get_contact_tools())
@@ -142,7 +145,6 @@ def get_all_tools() -> list:
     tools.extend(get_opportunity_tools())
     tools.extend(get_task_tools())
     tools.extend(get_note_tools())
-    tools.extend(get_soql_tools())
     tools.extend(get_report_tools())
     tools.extend(get_user_tools())
     tools.extend(get_email_tools())
@@ -202,7 +204,7 @@ def handle_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any
     ]
     if tool_name in quote_tools:
         return handle_quote_tool_call(tool_name, arguments)
-    if tool_name == "SALESFORCE_RUN_SOQL_QUERY":
+    if tool_name in ("SALESFORCE_RUN_SOQL_QUERY", "SALESFORCE_UPDATE_SOBJECT"):
         return handle_soql_tool_call(tool_name, arguments)
     if tool_name in ["SALESFORCE_LIST_REPORTS", "SALESFORCE_RUN_REPORT"]:
         return handle_report_tool_call(tool_name, arguments)
@@ -226,6 +228,7 @@ async def root(request: Request):
             "status": "ok",
             "server": "salesforce-azure",
             "version": "1.0.0",
+            "lead_convert_build": LEAD_CONVERT_BUILD,
             "protocol": "MCP",
             "transport": "SSE",
             "sse_endpoint": "/sse",
@@ -465,6 +468,33 @@ async def boomi_get_accounts(request: Request):
             ),
         )
 
+@app.get("/health/lead-convert")
+async def health_lead_convert(request: Request):
+    """Probe ConvertLeadRestApi reachability (does not require a valid lead Id)."""
+    sid = _extract_ui_session_id(request, None)
+    request.state.ui_session_id = sid
+    try:
+        sf = get_salesforce()
+        lead_id = request.query_params.get("lead_id") or request.query_params.get("leadId")
+        result = diagnose_lead_convert_health(sf, lead_id=lead_id)
+        return JSONResponse(
+            status_code=200 if result.get("success") else 503,
+            content=_merge_ui_session(result, sid),
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content=_merge_ui_session(
+                {
+                    "success": False,
+                    "lead_convert_build": LEAD_CONVERT_BUILD,
+                    "error": str(e),
+                },
+                sid,
+            ),
+        )
+
+
 @app.get("/.well-known/oauth-protected-resource")
 async def oauth_protected_resource(request: Request):
     """OAuth protected resource discovery"""
@@ -624,6 +654,8 @@ async def mcp_request(request: Request):
                     }
                 ],
             }
+            if isinstance(result, dict) and result.get("success") is False:
+                result_obj["isError"] = True
             if sid:
                 result_obj["sessionId"] = str(sid)
 
