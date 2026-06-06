@@ -38,6 +38,8 @@ def invalidate_salesforce_session() -> None:
 
 # Apex REST lead convert (same Bearer as Data API). Path segment after /services/apexrest/
 DEFAULT_APEX_CONVERT_LEAD_PATH = "convertLead"
+# Bump when lead-convert logic changes so Azure deploys can be verified via / or convert response.
+LEAD_CONVERT_BUILD = "2025-06-06-convert-v3"
 
 # Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
 LEAD_PRODUCT_OBJECT = "Lead_Product__c"
@@ -1288,6 +1290,50 @@ def _parse_lead_convert_response(resp: Any) -> Tuple[Optional[str], Optional[str
     return acc, con, opp
 
 
+def _pick_sf_id(row: Dict[str, Any], *keys: str) -> Optional[str]:
+    for k in keys:
+        v = row.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _query_lead_converted_ids(sf: Any, lead_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Read ConvertedAccountId / Contact / Opportunity from Lead after Apex convert."""
+    row = _query_lead_row_by_id(sf, str(lead_id).strip())
+    if not row or not row.get("IsConverted"):
+        return None, None, None
+    return (
+        row.get("ConvertedAccountId"),
+        row.get("ConvertedContactId"),
+        row.get("ConvertedOpportunityId"),
+    )
+
+
+def _deep_scan_convert_ids(node: Any, found: Dict[str, str]) -> None:
+    """Collect account/contact/opportunity ids from nested Apex JSON."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            kl = str(k).lower()
+            if isinstance(v, str) and _is_salesforce_id(v):
+                if kl in ("accountid", "account_id", "accountid__c") and "account" not in found:
+                    found["account"] = v
+                elif kl in ("contactid", "contact_id") and "contact" not in found:
+                    found["contact"] = v
+                elif kl in ("opportunityid", "opportunity_id") and "opportunity" not in found:
+                    found["opportunity"] = v
+                elif v.startswith("001") and "account" not in found:
+                    found["account"] = v
+                elif v.startswith("003") and "contact" not in found:
+                    found["contact"] = v
+                elif v.startswith("006") and "opportunity" not in found:
+                    found["opportunity"] = v
+            _deep_scan_convert_ids(v, found)
+    elif isinstance(node, list):
+        for item in node:
+            _deep_scan_convert_ids(item, found)
+
+
 def _parse_apex_convert_lead_response(data: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Parse JSON from Apex REST (ConvertLeadRestApi / LeadConversionResponse shapes)."""
     if isinstance(data, list) and data:
@@ -1302,20 +1348,21 @@ def _parse_apex_convert_lead_response(data: Any) -> Tuple[Optional[str], Optiona
     if not isinstance(inner, dict):
         return None, None, None
 
-    def _pick(row: Dict[str, Any], *keys: str) -> Optional[str]:
-        for k in keys:
-            v = row.get(k)
-            if v is not None and str(v).strip():
-                return str(v).strip()
-        return None
+    acc = _pick_sf_id(inner, "accountId", "AccountId", "account_id", "accountID")
+    con = _pick_sf_id(inner, "contactId", "ContactId", "contact_id", "contactID")
+    opp = _pick_sf_id(inner, "opportunityId", "OpportunityId", "opportunity_id", "opportunityID")
+    if acc and con and opp:
+        return acc, con, opp
+    found: Dict[str, str] = {}
+    _deep_scan_convert_ids(data, found)
+    return (
+        acc or found.get("account"),
+        con or found.get("contact"),
+        opp or found.get("opportunity"),
+    )
 
-    acc = _pick(inner, "accountId", "AccountId", "account_id", "accountID")
-    con = _pick(inner, "contactId", "ContactId", "contact_id", "contactID")
-    opp = _pick(inner, "opportunityId", "OpportunityId", "opportunity_id", "opportunityID")
-    return acc, con, opp
 
-
-def _build_apex_convert_request_body(
+def _apex_convert_payload_variants(
     lead_id: str,
     converted_status: str,
     opportunity_name: str,
@@ -1323,28 +1370,63 @@ def _build_apex_convert_request_body(
     account_id: Optional[str] = None,
     contact_id: Optional[str] = None,
     do_not_create_opportunity: bool = False,
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
-    JSON body aligned with org Apex LeadConversionRequest (ConvertLeadRestApi).
-    Sends both leadId and leadID because Apex JSON property names must match the class exactly.
+    Request bodies for org Apex. Tries documented contract first, then ConvertLeadRestApi shape.
+    Apex JSON.deserialize is case-sensitive on property names.
     """
     lid = str(lead_id).strip()
-    body: Dict[str, Any] = {
-        "leadId": lid,
-        "leadID": lid,
-        "convertedStatus": str(converted_status).strip(),
-        "createOpportunity": not do_not_create_opportunity,
-        "opportunityName": str(opportunity_name).strip(),
-        "overWriteLeadSource": False,
-        "overwriteLeadSource": False,
-        "sendNotificationEmail": False,
-        "sendEmailToOwner": False,
-    }
-    if account_id and str(account_id).strip():
-        body["accountId"] = str(account_id).strip()
-    if contact_id and str(contact_id).strip():
-        body["contactId"] = str(contact_id).strip()
-    return body
+    cst = str(converted_status).strip()
+    onm = str(opportunity_name).strip()
+    create_opp = not do_not_create_opportunity
+
+    def _extras(b: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(b)
+        if account_id and str(account_id).strip():
+            aid = str(account_id).strip()
+            out["accountID"] = aid
+            out["accountId"] = aid
+        if contact_id and str(contact_id).strip():
+            cid = str(contact_id).strip()
+            out["contactID"] = cid
+            out["contactId"] = cid
+        return out
+
+    return [
+        _extras(
+            {
+                "leadID": lid,
+                "convertedStatus": cst,
+                "createOpportunity": create_opp,
+                "opportunityName": onm,
+                "overWriteLeadSource": False,
+                "sendEmailToOwner": False,
+            }
+        ),
+        _extras(
+            {
+                "leadId": lid,
+                "convertedStatus": cst,
+                "createOpportunity": create_opp,
+                "opportunityName": onm,
+                "overWriteLeadSource": False,
+                "sendEmailToOwner": False,
+            }
+        ),
+        _extras(
+            {
+                "leadId": lid,
+                "leadID": lid,
+                "convertedStatus": cst,
+                "createOpportunity": create_opp,
+                "opportunityName": onm,
+                "overWriteLeadSource": False,
+                "overwriteLeadSource": False,
+                "sendNotificationEmail": False,
+                "sendEmailToOwner": False,
+            }
+        ),
+    ]
 
 
 def _apex_convert_rest_urls(sf: Any, path_seg: str, lead_id: str) -> List[str]:
@@ -1366,6 +1448,55 @@ def _apex_convert_rest_urls(sf: Any, path_seg: str, lead_id: str) -> List[str]:
     return out
 
 
+def _apex_response_failed(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    err = (
+        data.get("errorMessage")
+        or data.get("error_message")
+        or data.get("message")
+        or data.get("error")
+        or data.get("errors")
+    )
+    if err and str(err).strip():
+        if data.get("success") is not True and data.get("isSuccess") is not True:
+            has_ids = any(
+                data.get(k)
+                for k in (
+                    "accountID",
+                    "accountId",
+                    "contactID",
+                    "contactId",
+                    "opportunityID",
+                    "opportunityId",
+                )
+            )
+            if not has_ids:
+                return str(err).strip()
+    if data.get("success") is False or data.get("isSuccess") is False:
+        return str(err or "Apex convertLead returned success=false")
+    return None
+
+
+def _resolve_convert_triplet_after_apex(
+    sf: Any,
+    lead_id: str,
+    data: Any,
+    *,
+    do_not_create_opportunity: bool,
+) -> Optional[Tuple[str, str, str]]:
+    """Parse Apex JSON; if ids missing, read them from the converted Lead row."""
+    acc, con, opp = _parse_apex_convert_lead_response(data)
+    if not (acc and con) or (not do_not_create_opportunity and not opp):
+        q_acc, q_con, q_opp = _query_lead_converted_ids(sf, lead_id)
+        acc = acc or q_acc
+        con = con or q_con
+        opp = opp or q_opp
+    if acc and con and (opp or do_not_create_opportunity):
+        return str(acc), str(con), str(opp) if opp else ""
+    return None
+
+
 def _try_convert_lead_apex_rest(
     sf: Any,
     lead_id: str,
@@ -1385,7 +1516,7 @@ def _try_convert_lead_apex_rest(
         os.getenv("SF_APEX_CONVERT_LEAD_PATH", DEFAULT_APEX_CONVERT_LEAD_PATH).strip().strip("/")
         or DEFAULT_APEX_CONVERT_LEAD_PATH
     )
-    body = _build_apex_convert_request_body(
+    bodies = _apex_convert_payload_variants(
         lead_id,
         converted_status,
         opportunity_name,
@@ -1399,45 +1530,39 @@ def _try_convert_lead_apex_rest(
         "Accept": "application/json",
     }
     last_404_text = ""
-    for url in _apex_convert_rest_urls(sf, path_seg, lead_id):
-        resp = requests.post(url, json=body, headers=headers, timeout=120)
-        if resp.status_code == 404:
-            last_404_text = resp.text[:500]
-            print(f"[Lead] Apex convert 404 at {url}", file=sys.stderr)
-            continue
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"Apex convertLead HTTP {resp.status_code} at {url}: {resp.text[:2500]}"
+    last_error = ""
+    saw_non_404 = False
+    for body in bodies:
+        for url in _apex_convert_rest_urls(sf, path_seg, lead_id):
+            resp = requests.post(url, json=body, headers=headers, timeout=120)
+            if resp.status_code == 404:
+                last_404_text = resp.text[:500]
+                print(f"[Lead] Apex convert 404 at {url}", file=sys.stderr)
+                continue
+            saw_non_404 = True
+            if resp.status_code >= 400:
+                last_error = f"HTTP {resp.status_code} at {url}: {resp.text[:1500]}"
+                print(f"[Lead] Apex convert {last_error}", file=sys.stderr)
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                last_error = f"non-JSON from {url}: {resp.text[:1500]}"
+                continue
+            fail_msg = _apex_response_failed(data)
+            if fail_msg:
+                last_error = f"{fail_msg} (url={url}, body_keys={list(body.keys())})"
+                print(f"[Lead] Apex convert business error: {last_error}", file=sys.stderr)
+                continue
+            triplet = _resolve_convert_triplet_after_apex(
+                sf, lead_id, data, do_not_create_opportunity=do_not_create_opportunity
             )
-        try:
-            data = resp.json()
-        except ValueError:
-            raise RuntimeError(
-                f"Apex convertLead: response was not JSON from {url}: {resp.text[:2500]}"
-            ) from None
-        if isinstance(data, dict) and (
-            data.get("success") is False or data.get("isSuccess") is False
-        ):
-            msg = (
-                data.get("message")
-                or data.get("errorMessage")
-                or data.get("error")
-                or data.get("errors")
-                or data
-            )
-            raise RuntimeError(f"Apex convertLead reported failure: {msg}")
-        acc, con, opp = _parse_apex_convert_lead_response(data)
-        if acc and con and (opp or do_not_create_opportunity):
-            print(f"[Lead] Apex convert succeeded via {url}", file=sys.stderr)
-            return str(acc), str(con), str(opp) if opp else ""
-        if acc or con or opp:
-            raise RuntimeError(
-                f"Apex convertLead returned incomplete ids (account={acc!r}, contact={con!r}, "
-                f"opp={opp!r}) from {url}: {data!r}"
-            )
-        raise RuntimeError(
-            f"Apex convertLead returned no account/contact/opportunity ids from {url}: {data!r}"
-        )
+            if triplet:
+                print(f"[Lead] Apex convert succeeded via {url}", file=sys.stderr)
+                return triplet
+            last_error = f"no ids in response or on Lead after POST {url}: {data!r}"
+    if saw_non_404 and last_error:
+        raise RuntimeError(f"Apex convertLead: {last_error}")
     if last_404_text:
         print(f"[Lead] Apex convert last 404 body: {last_404_text}", file=sys.stderr)
     return None
@@ -1558,6 +1683,22 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
     lead_row = _query_lead_row_by_id(sf, lead_id)
     if not lead_row:
         raise RuntimeError(f"No Lead found with Id {lead_id}")
+    if lead_row.get("IsConverted"):
+        acc0 = lead_row.get("ConvertedAccountId")
+        con0 = lead_row.get("ConvertedContactId")
+        opp0 = lead_row.get("ConvertedOpportunityId")
+        if acc0 or con0:
+            return {
+                "success": True,
+                "account_id": acc0,
+                "contact_id": con0,
+                "opportunity_id": opp0,
+                "converted_status": lead_row.get("Status"),
+                "opportunity_name": None,
+                "convert_via": "already_converted",
+                "message": "Lead was already converted.",
+                "line_items_created": 0,
+            }
 
     existing_account_id = (convert_options.get("account_id") or "").strip() or None
     existing_contact_id = (convert_options.get("contact_id") or "").strip() or None
@@ -1604,44 +1745,10 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
         acc_id, con_id, opp_id = apex_triplet
         convert_via = "apex_rest"
     else:
+        acc_id, con_id, opp_id = None, None, None
+        soap_error = ""
+        rest_error = ""
         try:
-            raw = sf.restful(path, method="POST", json=payload)
-            acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
-        except (SalesforceResourceNotFound, SalesforceError) as rest_ex:
-            rest_fail = str(rest_ex)
-            if isinstance(rest_ex, SalesforceError) and getattr(rest_ex, "status", None) not in (
-                None,
-                404,
-            ):
-                raise
-            print(
-                f"[Lead] REST LeadConvert unavailable ({rest_fail[:200]}); trying Partner SOAP...",
-                file=sys.stderr,
-            )
-            try:
-                convert_via = "soap"
-                acc_id, con_id, opp_id = _convert_lead_soap(
-                    sf,
-                    str(lead_id),
-                    converted_status,
-                    str(opportunity_name).strip(),
-                    account_id=existing_account_id,
-                    contact_id=existing_contact_id,
-                    do_not_create_opportunity=do_not_create_opportunity,
-                )
-            except Exception as soap_ex:
-                raise RuntimeError(
-                    _lead_convert_unavailable_message(
-                        str(lead_id),
-                        "Apex REST /services/apexrest/convertLead is not deployed (404), "
-                        "REST LeadConvert quick action is not available, and SOAP convertLead failed. "
-                        f"SOAP error: {soap_ex}",
-                    )
-                ) from soap_ex
-        except Exception as rest_other:
-            if "404" not in str(rest_other) and "NOT_FOUND" not in str(rest_other).upper():
-                raise
-            print(f"[Lead] REST LeadConvert failed; trying Partner SOAP: {rest_other}", file=sys.stderr)
             convert_via = "soap"
             acc_id, con_id, opp_id = _convert_lead_soap(
                 sf,
@@ -1652,11 +1759,48 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
                 contact_id=existing_contact_id,
                 do_not_create_opportunity=do_not_create_opportunity,
             )
+        except Exception as soap_ex:
+            soap_error = str(soap_ex)
+            print(f"[Lead] SOAP convertLead failed: {soap_error}", file=sys.stderr)
+
+        if not (acc_id and con_id):
+            rest_error = ""
+            try:
+                convert_via = "rest"
+                raw = sf.restful(path, method="POST", json=payload)
+                acc_id, con_id, opp_id = _parse_lead_convert_response(raw)
+            except Exception as rest_ex:
+                rest_error = str(rest_ex)
+                print(f"[Lead] REST LeadConvert failed: {rest_error}", file=sys.stderr)
+
+        if not (acc_id and con_id):
+            q_acc, q_con, q_opp = _query_lead_converted_ids(sf, lead_id)
+            if q_acc or q_con:
+                acc_id, con_id, opp_id = q_acc, q_con, q_opp
+                convert_via = "lead_query"
+            else:
+                raise RuntimeError(
+                    _lead_convert_unavailable_message(
+                        str(lead_id),
+                        "Apex REST returned 404 or failed, SOAP and REST quick action did not convert the lead. "
+                        f"SOAP: {soap_error or 'not attempted or no error captured'}. "
+                        f"REST: {rest_error or 'not attempted'}. "
+                        "Check Azure logs for [Lead] Apex convert lines.",
+                    )
+                )
 
     if existing_account_id:
         acc_id = acc_id or existing_account_id
+    if not (acc_id and con_id):
+        q_acc, q_con, q_opp = _query_lead_converted_ids(sf, lead_id)
+        acc_id = acc_id or q_acc
+        con_id = con_id or q_con
+        opp_id = opp_id or q_opp
     if not acc_id and not con_id:
         raise RuntimeError("Lead convert returned no account or contact id")
+    if not do_not_create_opportunity and not opp_id:
+        _, _, q_opp = _query_lead_converted_ids(sf, lead_id)
+        opp_id = opp_id or q_opp
     if not do_not_create_opportunity and not opp_id:
         raise RuntimeError(
             "Lead convert did not return an opportunity id; ensure the org allows creating "
@@ -1672,6 +1816,7 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
         "opportunity_name": opportunity_name,
         "convert_via": convert_via,
         "used_existing_account": bool(existing_account_id),
+        "lead_convert_build": LEAD_CONVERT_BUILD,
     }
     if existing_account_id:
         result["existing_account_id"] = existing_account_id
@@ -1690,6 +1835,54 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
 
     print(f"[Lead] Converted lead {lead_id} -> account={acc_id} contact={con_id} opp={opp_id}", file=sys.stderr)
     return result
+
+
+def diagnose_lead_convert_health(sf: Any, lead_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Probe Apex REST convertLead without converting. POSTs a minimal body and reports HTTP status.
+    If lead_id is provided, uses it in the payload (lead is not converted on 4xx/validation errors).
+    """
+    path_seg = (
+        os.getenv("SF_APEX_CONVERT_LEAD_PATH", DEFAULT_APEX_CONVERT_LEAD_PATH).strip().strip("/")
+        or DEFAULT_APEX_CONVERT_LEAD_PATH
+    )
+    lid = (lead_id or "00Q000000000000").strip()
+    status = _resolve_converted_status(sf, "Converted")
+    body = {
+        "leadID": lid,
+        "convertedStatus": status,
+        "createOpportunity": True,
+        "opportunityName": "Health Check",
+        "overWriteLeadSource": False,
+        "sendEmailToOwner": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {sf.session_id}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    probes: List[Dict[str, Any]] = []
+    for url in _apex_convert_rest_urls(sf, path_seg, lid):
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=60)
+            snippet = (resp.text or "")[:800]
+            probes.append({"url": url, "status": resp.status_code, "body": snippet})
+        except Exception as ex:
+            probes.append({"url": url, "status": None, "error": str(ex)})
+    apex_ok = any(p.get("status") not in (None, 404) for p in probes)
+    return {
+        "success": apex_ok,
+        "lead_convert_build": LEAD_CONVERT_BUILD,
+        "instance": sf.sf_instance,
+        "apex_path": path_seg,
+        "converted_status": status,
+        "probes": probes,
+        "hint": (
+            "404 on all probes: integration user cannot see ConvertLeadRestApi. "
+            "200 with errorMessage: Apex reachable; check message. "
+            "200 with accountID/contactID: convert path works."
+        ),
+    }
 
 
 def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -1735,6 +1928,7 @@ def convert_lead(sf: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 "error": err,
                 "error_code": "LEAD_CONVERT_FAILED",
                 "lead_id": lid,
+                "lead_convert_build": LEAD_CONVERT_BUILD,
                 "account_id": None,
                 "contact_id": None,
                 "opportunity_id": None,
