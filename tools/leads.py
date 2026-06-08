@@ -39,7 +39,7 @@ def invalidate_salesforce_session() -> None:
 # Apex REST lead convert (same Bearer as Data API). Path segment after /services/apexrest/
 DEFAULT_APEX_CONVERT_LEAD_PATH = "convertLead"
 # Bump when lead-convert logic changes so Azure deploys can be verified via / or convert response.
-LEAD_CONVERT_BUILD = "2025-06-06-convert-v3"
+LEAD_CONVERT_BUILD = "2025-06-06-convert-v4-dedupe-products"
 
 # Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
 LEAD_PRODUCT_OBJECT = "Lead_Product__c"
@@ -1606,10 +1606,73 @@ def _get_standard_pricebook_id(sf: Any) -> str:
     return recs[0]["Id"]
 
 
-def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str) -> Dict[str, Any]:
-    """Standard price book, mandatory platform event, Lead_Product__c -> OpportunityLineItem."""
+def _existing_opp_product_ids(sf: Any, opportunity_id: str) -> set:
+    """Product2 Ids already on the opportunity (via OpportunityLineItem)."""
+    q = (
+        "SELECT Product2Id FROM OpportunityLineItem "
+        f"WHERE OpportunityId = '{_lead_escape(opportunity_id)}'"
+    )
+    res = sf.query(q)
+    return {
+        str(r["Product2Id"])
+        for r in (res.get("records") or [])
+        if r.get("Product2Id")
+    }
+
+
+def _dedupe_lead_products_by_product(
+    lead_products: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """One row per Product__c; sum Quantity__c when the same product appears twice."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for row in lead_products:
+        prod_id = row.get(LEAD_PRODUCT_PRODUCT_FIELD)
+        if not prod_id:
+            continue
+        pid = str(prod_id)
+        qty = row.get(LEAD_PRODUCT_QUANTITY_FIELD)
+        try:
+            qty_f = float(qty) if qty is not None else 1.0
+        except (TypeError, ValueError):
+            qty_f = 1.0
+        if pid in merged:
+            prev = merged[pid].get(LEAD_PRODUCT_QUANTITY_FIELD) or 0
+            try:
+                merged[pid][LEAD_PRODUCT_QUANTITY_FIELD] = float(prev) + qty_f
+            except (TypeError, ValueError):
+                merged[pid][LEAD_PRODUCT_QUANTITY_FIELD] = qty_f
+        else:
+            merged[pid] = dict(row)
+            merged[pid][LEAD_PRODUCT_QUANTITY_FIELD] = qty_f
+    return list(merged.values())
+
+
+def _post_convert_opportunity_extras(
+    sf: Any,
+    lead_id: str,
+    opportunity_id: str,
+    *,
+    convert_via: str = "rest",
+) -> Dict[str, Any]:
+    """
+    Standard price book, platform event, Lead_Product__c -> OpportunityLineItem.
+    Skipped when convert_via is apex_rest (ConvertLeadRestApi already performs these steps).
+    """
     notes: List[str] = []
+    if convert_via == "apex_rest":
+        notes.append(
+            "Skipped post-convert pricebook, platform event, and products; "
+            "ConvertLeadRestApi already applied them."
+        )
+        print(
+            f"[Lead] Skipping post-convert extras for opp {opportunity_id} "
+            "(ConvertLeadRestApi handled pricebook, event, and line items)",
+            file=sys.stderr,
+        )
+        return {"line_items_created": 0, "line_items_skipped": 0, "notes": notes}
+
     line_items_created = 0
+    line_items_skipped = 0
     standard_pb_id = _get_standard_pricebook_id(sf)
     opp_sf = SFType("Opportunity", sf.session_id, sf.sf_instance)
     opp_sf.update(opportunity_id, {"Pricebook2Id": standard_pb_id})
@@ -1623,19 +1686,19 @@ def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str)
     )
     lp_res = sf.query(lp_q)
 
-    lead_products = lp_res.get("records") or []
+    lead_products = _dedupe_lead_products_by_product(lp_res.get("records") or [])
     if not lead_products:
-        return {"line_items_created": 0, "notes": notes}
-
-    opp_sf.update(opportunity_id, {"Pricebook2Id": standard_pb_id})
+        return {"line_items_created": 0, "line_items_skipped": 0, "notes": notes}
 
     product_ids: List[str] = []
     for row in lead_products:
         pid = row.get(LEAD_PRODUCT_PRODUCT_FIELD)
         if pid:
-            product_ids.append(pid)
+            product_ids.append(str(pid))
     if not product_ids:
-        return {"line_items_created": 0, "notes": notes}
+        return {"line_items_created": 0, "line_items_skipped": 0, "notes": notes}
+
+    existing_products = _existing_opp_product_ids(sf, opportunity_id)
 
     in_list = ",".join(f"'{_lead_escape(x)}'" for x in product_ids)
     pbe_q = (
@@ -1652,6 +1715,14 @@ def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str)
     for row in lead_products:
         prod_id = row.get(LEAD_PRODUCT_PRODUCT_FIELD)
         if not prod_id or prod_id not in pbe_by_product:
+            continue
+        prod_key = str(prod_id)
+        if prod_key in existing_products:
+            line_items_skipped += 1
+            print(
+                f"[Lead] Skipping duplicate OLI for Product2 {prod_key} on opp {opportunity_id}",
+                file=sys.stderr,
+            )
             continue
         pbe = pbe_by_product[prod_id]
         qty = row.get(LEAD_PRODUCT_QUANTITY_FIELD)
@@ -1670,8 +1741,13 @@ def _post_convert_opportunity_extras(sf: Any, lead_id: str, opportunity_id: str)
             }
         )
         line_items_created += 1
+        existing_products.add(prod_key)
 
-    return {"line_items_created": line_items_created, "notes": notes}
+    return {
+        "line_items_created": line_items_created,
+        "line_items_skipped": line_items_skipped,
+        "notes": notes,
+    }
 
 
 def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]) -> Dict[str, Any]:
@@ -1823,8 +1899,12 @@ def _convert_lead_execute(sf: Any, lead_id: str, convert_options: Dict[str, Any]
 
     if opp_id:
         try:
-            extras = _post_convert_opportunity_extras(sf, lead_id, opp_id)
+            extras = _post_convert_opportunity_extras(
+                sf, lead_id, opp_id, convert_via=convert_via
+            )
             result["line_items_created"] = extras["line_items_created"]
+            if extras.get("line_items_skipped"):
+                result["line_items_skipped"] = extras["line_items_skipped"]
             if extras.get("notes"):
                 result["notes"] = extras["notes"]
         except Exception as post_ex:
