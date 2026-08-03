@@ -39,7 +39,7 @@ def invalidate_salesforce_session() -> None:
 # Apex REST lead convert (same Bearer as Data API). Path segment after /services/apexrest/
 DEFAULT_APEX_CONVERT_LEAD_PATH = "convertLead"
 # Bump when lead-convert logic changes so Azure deploys can be verified via / or convert response.
-LEAD_CONVERT_BUILD = "2025-06-06-convert-v4-dedupe-products"
+LEAD_CONVERT_BUILD = "2025-06-06-convert-v5-no-dup-json-keys"
 
 # Custom metadata aligned with ConvertLeadApex (adjust if your org uses different API names)
 LEAD_PRODUCT_OBJECT = "Lead_Product__c"
@@ -1348,9 +1348,9 @@ def _parse_apex_convert_lead_response(data: Any) -> Tuple[Optional[str], Optiona
     if not isinstance(inner, dict):
         return None, None, None
 
-    acc = _pick_sf_id(inner, "accountId", "AccountId", "account_id", "accountID")
-    con = _pick_sf_id(inner, "contactId", "ContactId", "contact_id", "contactID")
-    opp = _pick_sf_id(inner, "opportunityId", "OpportunityId", "opportunity_id", "opportunityID")
+    acc = _pick_sf_id(inner, "accountID", "accountId", "AccountId", "account_id")
+    con = _pick_sf_id(inner, "contactID", "contactId", "ContactId", "contact_id")
+    opp = _pick_sf_id(inner, "opportunityID", "opportunityId", "OpportunityId", "opportunity_id")
     if acc and con and opp:
         return acc, con, opp
     found: Dict[str, str] = {}
@@ -1372,61 +1372,49 @@ def _apex_convert_payload_variants(
     do_not_create_opportunity: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Request bodies for org Apex. Tries documented contract first, then ConvertLeadRestApi shape.
-    Apex JSON.deserialize is case-sensitive on property names.
+    Request bodies for ConvertLeadRestApi / LeadConversionRequest.
+
+    Salesforce JSON.deserialize treats property names case-insensitively for duplicates:
+    sending both leadId and leadID in one body raises
+    \"Duplicate field: ConvertLeadRestApi.LeadConversionRequest.leadID\".
+    Each variant uses exactly one spelling of each field.
     """
     lid = str(lead_id).strip()
     cst = str(converted_status).strip()
     onm = str(opportunity_name).strip()
     create_opp = not do_not_create_opportunity
+    aid = str(account_id).strip() if account_id and str(account_id).strip() else None
+    cid = str(contact_id).strip() if contact_id and str(contact_id).strip() else None
 
-    def _extras(b: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(b)
-        if account_id and str(account_id).strip():
-            aid = str(account_id).strip()
-            out["accountID"] = aid
-            out["accountId"] = aid
-        if contact_id and str(contact_id).strip():
-            cid = str(contact_id).strip()
-            out["contactID"] = cid
-            out["contactId"] = cid
-        return out
+    # Primary: matches ConvertLeadApex / ConvertLeadRestApi (leadID, accountID, contactID)
+    primary: Dict[str, Any] = {
+        "leadID": lid,
+        "convertedStatus": cst,
+        "createOpportunity": create_opp,
+        "opportunityName": onm,
+        "overWriteLeadSource": False,
+        "sendEmailToOwner": False,
+    }
+    if aid:
+        primary["accountID"] = aid
+    if cid:
+        primary["contactID"] = cid
 
-    return [
-        _extras(
-            {
-                "leadID": lid,
-                "convertedStatus": cst,
-                "createOpportunity": create_opp,
-                "opportunityName": onm,
-                "overWriteLeadSource": False,
-                "sendEmailToOwner": False,
-            }
-        ),
-        _extras(
-            {
-                "leadId": lid,
-                "convertedStatus": cst,
-                "createOpportunity": create_opp,
-                "opportunityName": onm,
-                "overWriteLeadSource": False,
-                "sendEmailToOwner": False,
-            }
-        ),
-        _extras(
-            {
-                "leadId": lid,
-                "leadID": lid,
-                "convertedStatus": cst,
-                "createOpportunity": create_opp,
-                "opportunityName": onm,
-                "overWriteLeadSource": False,
-                "overwriteLeadSource": False,
-                "sendNotificationEmail": False,
-                "sendEmailToOwner": False,
-            }
-        ),
-    ]
+    # Fallback spelling only (never combine with primary keys in the same object)
+    alt: Dict[str, Any] = {
+        "leadId": lid,
+        "convertedStatus": cst,
+        "createOpportunity": create_opp,
+        "opportunityName": onm,
+        "overWriteLeadSource": False,
+        "sendEmailToOwner": False,
+    }
+    if aid:
+        alt["accountId"] = aid
+    if cid:
+        alt["contactId"] = cid
+
+    return [primary, alt]
 
 
 def _apex_convert_rest_urls(sf: Any, path_seg: str, lead_id: str) -> List[str]:
